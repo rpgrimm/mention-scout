@@ -1,0 +1,12 @@
+# BEGIN OPENCLAW SOFTWARE FACTORY
+.venv/
+__pycache__/
+*.py[cod]
+dist/
+.factory/runtime/
+*.bak-*
+.env
+.env.*
+!.env.example
+.kalshi_mention_scout_*cache*.json
+# END OPENCLAW SOFTWARE FACTORY

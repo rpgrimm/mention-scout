@@ -1,0 +1,26 @@
+schema_version: 1
+project:
+  id: "mention-scout"
+  template: "mention-scout"
+  entry_script: "kalshi_mention_scout.py"
+  resolved_entry_script: "kalshi_mention_scout.py"
+repository:
+  path: "/home/candr/src/mention_scout"
+  default_branch: "main"
+agents:
+  coordinator: "mention-scout-factory"
+  specification: "mention-scout-spec"
+  implementation: "mention-scout-implement"
+  verification: "mention-scout-verify"
+  shipping: "mention-scout-ship"
+commands:
+  create_worktree: "./scripts/factory-worktree.sh create <task-id>"
+  setup_worktree: "./.openclaw/worktree-setup.sh"
+  test: "./scripts/factory-test.sh"
+  package: "./scripts/factory-package.sh"
+policy:
+  require_approved_specification: true
+  require_independent_verification: true
+  require_human_release_approval: true
+  allow_real_email_during_automated_testing: false
+  allow_trading_actions: false
