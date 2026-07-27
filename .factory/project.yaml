@@ -7,6 +7,12 @@ project:
 repository:
   path: "/home/candr/src/mention_scout"
   default_branch: "main"
+  github:
+    owner: "rpgrimm"
+    name: "mention-scout"
+    url: "https://github.com/rpgrimm/mention-scout"
+    visibility: "private"
+    issues: "all-todos"
 agents:
   coordinator: "mention-scout-factory"
   specification: "mention-scout-spec"
