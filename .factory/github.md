@@ -45,3 +45,4 @@ Status: `status:needs-triage` `status:ready` `status:blocked` `status:wontfix`
 | MS-0003 | #3 | Minimal deterministic `tests/` suite | `type:chore` `P2` `status:needs-triage` |
 | MS-0004 | #4 | Email dry-run / injectable send seam | `type:feature` `P2` `status:needs-triage` |
 | MS-0005 | #5 | Versioned implementation filename layout | `type:chore` `P3` `status:needs-triage` |
+| MS-0006 | #7 | Mention type labels, filter, email subject prefix | `type:feature` `P1` `status:blocked` |
