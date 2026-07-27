@@ -1,6 +1,7 @@
 # MS-0002 — Stable `mention_scout.py` command surface
 
 Status: **PROPOSED** / awaiting owner approval  
+GitHub issue: https://github.com/rpgrimm/mention-scout/issues/2  
 Type: packaging / entrypoint alignment (no discovery-logic change)  
 Related: MS-0001 audit, `.factory/improvements/MS-0001-candidates.md`  
 Repository: `/home/candr/src/mention_scout`

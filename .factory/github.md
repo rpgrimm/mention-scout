@@ -38,10 +38,10 @@ Status: `status:needs-triage` `status:ready` `status:blocked` `status:wontfix`
 
 ## Initial backlog seed (from MS-0001)
 
-| Local ID | Intent | Suggested labels |
-|----------|--------|------------------|
-| MS-0001 | Initial audit (complete) | `type:chore` `P3` — close after mirror |
-| MS-0002 | Stable `./mention_scout.py` entrypoint | `type:feature` `P1` `status:blocked` (awaiting owner spec approval) |
-| MS-0003 | Minimal deterministic `tests/` suite | `type:chore` `P2` `status:needs-triage` |
-| MS-0004 | Email dry-run / injectable send seam | `type:feature` `P2` `status:needs-triage` |
-| MS-0005 | Versioned implementation filename layout | `type:chore` `P3` `status:needs-triage` |
+| Local ID | GitHub | Intent | Labels |
+|----------|--------|--------|--------|
+| MS-0001 | #1 (closed) | Initial audit (complete) | `type:chore` `P3` |
+| MS-0002 | #2 | Stable `./mention_scout.py` entrypoint | `type:feature` `P1` `status:blocked` |
+| MS-0003 | #3 | Minimal deterministic `tests/` suite | `type:chore` `P2` `status:needs-triage` |
+| MS-0004 | #4 | Email dry-run / injectable send seam | `type:feature` `P2` `status:needs-triage` |
+| MS-0005 | #5 | Versioned implementation filename layout | `type:chore` `P3` `status:needs-triage` |
