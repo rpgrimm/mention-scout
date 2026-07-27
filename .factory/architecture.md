@@ -1,6 +1,6 @@
 # Architecture Notes — mention-scout
 
-Status: MS-0001 audit baseline (2026-07-25); MS-0002 stable entry symlink applied (2026-07-27)  
+Status: MS-0001 audit baseline (2026-07-25); MS-0002 stable entry symlink applied (2026-07-27); MS-0006 type labels/filter/subject (implementation)  
 Product: find Kalshi mention markets and notify the owner; **read-only w.r.t. trading**
 
 ## Repository layout
@@ -14,7 +14,7 @@ Product: find Kalshi mention markets and notify the owner; **read-only w.r.t. tr
 | `scripts/factory-test.sh` | `py_compile` resolved implementation once; `--help` and `--version` smoke on both `mention_scout.py` and `kalshi_mention_scout.py`; runs `pytest` only if `tests/` exists |
 | `scripts/factory-package.sh` | Clean-tree `git archive` tarball + sha256 under `dist/` |
 | `.gitignore` | Ignores `.venv/`, `dist/`, `.env*`, `.factory/runtime/`, and local cache globs `.kalshi_mention_scout_*cache*.json` |
-| `tests/` | **Absent** — no automated unit/regression suite yet |
+| `tests/` | Offline unit tests (MS-0006 mention types; expand with MS-0003+) |
 | `dist/`, `.factory/{improvements,specs,tasks,verification,releases,runtime}/` | Packaging and factory lifecycle dirs (empty at audit time except contracts/inbox) |
 
 ### File naming / version situation (current)
@@ -30,20 +30,27 @@ Long-term model (partially realized): stable user command (`./mention_scout.py`)
 
 ## Runtime shape
 
-Monolithic single module, **no classes** (~62 top-level functions). Standard library only (`urllib`, `argparse`, `subprocess`, `zoneinfo`, etc.). External runtime dependency for email: **`swaks`** on `PATH`. Credential file default: `~/.config/.google-password` (sourced via zsh/`sh`; never printed or cached by the scout).
+Monolithic single module (small `MentionType` dataclass + pure helpers; otherwise functions). Standard library only (`urllib`, `argparse`, `subprocess`, `zoneinfo`, etc.). External runtime dependency for email: **`swaks`** on `PATH`. Credential file default: `~/.config/.google-password` (sourced via zsh/`sh`; never printed or cached by the scout).
 
 ## Logical modules (within `kalshi_mention_scout.py`)
 
 1. **Constants / classification patterns** — API base URLs, cache/queue defaults, mention/say regexes, ticker-date regexes, ANSI colors.
 2. **HTTP client** — `http_get_json` (timeouts, retries with backoff for 429/5xx, actionable `RuntimeError`s).
 3. **Kalshi discovery** — `iter_markets`, `iter_events_with_nested_markets`, `scan_mention_events`, `scan_paused_mention_markets`, `merge_market_lists`, `fetch_event_metadata`.
-4. **Mention classification** — `is_mention_event`, `is_mention_market`, `contains_filter`, ticker `MENTION` shortcut + text rules.
-5. **Cache** — load/usability/atomic write/payload build; compact vs full modes.
+4. **Mention classification** — binary `is_mention_event` / `is_mention_market`, `contains_filter`, plus MS-0006 type taxonomy (`MentionType` registry, ordered rules, `mention_type_for_event` / `mention_type_for_market`, `--type` parse/filter helpers).
+5. **Cache** — load/usability/atomic write/payload build; compact vs full modes. Type is **not** cached (`CACHE_FORMAT_VERSION` unchanged); derived at filter/display time.
 6. **Schedule / window selection** — event-date resolver vs trading close; local calendar window.
-7. **Normalization / display** — `market_record`, overview grouping, human renderers, Kalshi public URL builder.
-8. **Watch mode** — child-process JSON refresh, new-parent-ticker detection, optional queue + email.
-9. **Email** — password load, `swaks` send, test-email path.
+7. **Normalization / display** — `market_record` (additive `mention_type` / `mention_type_label`), overview grouping, human renderers, Kalshi public URL builder.
+8. **Watch mode** — child-process JSON refresh, new-parent-ticker detection, optional queue + email. `--type` is not stripped by `_watch_child_arguments`.
+9. **Email** — password load, `swaks` send, typed subject via `format_new_market_email_subject`, body `Type:` line, test-email path.
 10. **CLI** — `build_parser`, `main`.
+
+### MS-0006 type layer (summary)
+
+- Machine ids: `face-the-nation`, `world-news-tonight`, `earnings`, `trump`, `say`, `other`.
+- Display labels: `Face the Nation`, `World News Tonight`, `earnings`, `Trump`, `say`, `other`.
+- CLI: `--type` comma-separated any-of filter; aliases `ftn`, `wnt`, `world-news`; AND with `--contains`; default all types.
+- Email subject always: `[Kalshi] {display_label} | NEW: {event_ticker}`.
 
 ## Entry points and CLI
 
@@ -79,7 +86,9 @@ Primary process entry: `main()` via `if __name__ == "__main__"`.
 | `--google-password-file` | `~/.config/.google-password` | |
 | `--email-to` / `--email-from` / `--smtp-auth-user` | hard-coded owner Gmail defaults | |
 | `--smtp-server` | `smtp.gmail.com:587` | |
-| Output | grouped human | `--overview`, `--flat`, `--json`, `--show-rules`, `--no-color`, `--contains`, `--verbose` |
+| `--contains` | off | Case-insensitive substring on market text; AND with `--type` |
+| `--type` | off (all types) | Comma-separated mention type ids (any-of); aliases `ftn`/`wnt`/`world-news` |
+| Output | grouped human | `--overview`, `--flat`, `--json`, `--show-rules`, `--no-color`, `--verbose` |
 
 Guardrail: preserve these CLI defaults and cache compatibility unless a deliberate approved spec changes them.
 
