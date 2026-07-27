@@ -1,6 +1,6 @@
 # Architecture Notes — mention-scout
 
-Status: observed from MS-0001 read-only audit (2026-07-25)  
+Status: MS-0001 audit baseline (2026-07-25); MS-0002 stable entry symlink applied (2026-07-27)  
 Product: find Kalshi mention markets and notify the owner; **read-only w.r.t. trading**
 
 ## Repository layout
@@ -8,10 +8,10 @@ Product: find Kalshi mention markets and notify the owner; **read-only w.r.t. tr
 | Path | Role |
 |------|------|
 | `kalshi_mention_scout.py` | Sole product implementation (~2058 lines). Docstring self-identifies as `kalshi_mention_scout_v16.py`. `VERSION = "16.0.0"`. |
-| `mention_scout.py` | **Not present** in repo root (no file, no symlink). Factory/AGENTS guardrails still name this as the user-facing stable command. |
+| `mention_scout.py` | Stable user-facing entry: relative symlink → `kalshi_mention_scout.py` (MS-0002). |
 | `AGENTS.md`, `.factory/*` | Factory contracts, standards, release policy |
 | `scripts/factory-worktree.sh` | Create/list/remove task git worktrees |
-| `scripts/factory-test.sh` | `py_compile` + `--help` smoke on `kalshi_mention_scout.py`; runs `pytest` only if `tests/` exists |
+| `scripts/factory-test.sh` | `py_compile` resolved implementation once; `--help` and `--version` smoke on both `mention_scout.py` and `kalshi_mention_scout.py`; runs `pytest` only if `tests/` exists |
 | `scripts/factory-package.sh` | Clean-tree `git archive` tarball + sha256 under `dist/` |
 | `.gitignore` | Ignores `.venv/`, `dist/`, `.env*`, `.factory/runtime/`, and local cache globs `.kalshi_mention_scout_*cache*.json` |
 | `tests/` | **Absent** — no automated unit/regression suite yet |
@@ -21,12 +21,12 @@ Product: find Kalshi mention markets and notify the owner; **read-only w.r.t. tr
 
 - Single on-disk implementation: `kalshi_mention_scout.py` (executable UTF-8 Python 3).
 - Internal identity: docstring `kalshi_mention_scout_v16.py`, `VERSION = "16.0.0"`, `CACHE_FORMAT_VERSION = 5`, `QUEUE_FORMAT_VERSION = 1`.
-- **No** separate versioned filename (e.g. `kalshi_mention_scout_v16.py`).
-- **No** `mention_scout.py` stable symlink/wrapper.
-- `.factory/project.yaml` `entry_script` / `resolved_entry_script`: both `kalshi_mention_scout.py`.
-- Factory test/package scripts target `kalshi_mention_scout.py` only.
+- **No** separate versioned filename (e.g. `kalshi_mention_scout_v16.py`) yet — deferred (MS-0005).
+- Stable user command: `mention_scout.py` → relative symlink to `kalshi_mention_scout.py` (MS-0002).
+- `.factory/project.yaml`: `entry_script` / `stable_entry_script` = `mention_scout.py`; `resolved_entry_script` = `kalshi_mention_scout.py`.
+- Factory tests smoke both entry paths; package archive includes the symlink via git.
 
-Intended long-term model (from AGENTS/standards, not yet realized on disk): versioned implementation files + stable user command (`./mention_scout.py`) updated only after independent verification PASS and explicit owner approval.
+Long-term model (partially realized): stable user command (`./mention_scout.py`) is present; versioned implementation filenames remain a later step and are updated only after independent verification PASS and explicit owner approval.
 
 ## Runtime shape
 
@@ -208,7 +208,7 @@ Atomic write: temp file in same dir, `0o600`, fsync, `os.replace`. Incompatible/
 
 ## Packaging and factory scripts
 
-- **Test:** compile resolved entry + `--help`; optional pytest.
+- **Test:** compile resolved entry once; `--help` + `--version` on stable and resolved entries; optional pytest.
 - **Package:** refuse dirty tree; `git archive` → `dist/mention-scout-<version>.tar.gz` + `.sha256`.
 - **Worktree:** branch `openclaw/<task-id>` under `~/.openclaw/factory-worktrees/mention-scout/` (or `FACTORY_WORKTREE_ROOT`); runs `.openclaw/worktree-setup.sh` (venv + optional deps files if present).
 
@@ -221,8 +221,8 @@ Atomic write: temp file in same dir, `0o600`, fsync, `os.replace`. Incompatible/
 
 ## Gaps relevant to factory work
 
-1. Stable `./mention_scout.py` command named in guardrails but missing on disk.
-2. Versioned implementation filename + symlink model not materialized (v16 lives inside `kalshi_mention_scout.py`).
+1. ~~Stable `./mention_scout.py` command named in guardrails but missing on disk.~~ Addressed by MS-0002 (relative symlink).
+2. Versioned implementation filename model not fully materialized (v16 still lives inside `kalshi_mention_scout.py`; stretch deferred).
 3. No `tests/` directory despite standards requiring regression tests for date/status/cache/dup/watch/email changes.
 4. Email path not mock-friendly without patching subprocess.
 5. Hard-coded default notification addresses in argparse (functional for owner machine; less ideal for shared/package use).

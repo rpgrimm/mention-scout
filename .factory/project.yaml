@@ -2,7 +2,10 @@ schema_version: 1
 project:
   id: "mention-scout"
   template: "mention-scout"
-  entry_script: "kalshi_mention_scout.py"
+  # Stable user-facing command (relative symlink to resolved implementation).
+  entry_script: "mention_scout.py"
+  stable_entry_script: "mention_scout.py"
+  # Actual implementation file on disk.
   resolved_entry_script: "kalshi_mention_scout.py"
 repository:
   path: "/home/candr/src/mention_scout"
