@@ -7,7 +7,7 @@ and the active task/specification before changing code.
 Lifecycle: triage → specification → implementation worktree → independent
 verification → human approval → ship.
 
-Stable user command: `kalshi_mention_scout.py`.
+Stable user command: `./mention_scout.py` (symlink → `kalshi_mention_scout.py`).
 
 ## mention_scout.py guardrails
 
