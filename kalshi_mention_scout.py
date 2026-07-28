@@ -91,6 +91,7 @@ import sys
 import time
 import subprocess
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -124,6 +125,230 @@ SAY_EVENT_RE = re.compile(
     r"\bwhat\s+(?:will|would|does|did)\b.{0,120}?\b(?:say|says|said)\b",
     re.IGNORECASE,
 )
+
+# ---------------------------------------------------------------------------
+# Mention type taxonomy (MS-0006)
+# Deterministic, ordered rules. First match wins. Extend this table when the
+# owner requests a new family; keep offline unit tests in lockstep.
+# Priority: face-the-nation → world-news-tonight → earnings → trump → say → other
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MentionType:
+    """Stable machine id + human display label for one mention family."""
+
+    id: str
+    label: str
+
+
+MENTION_TYPE_REGISTRY: tuple[MentionType, ...] = (
+    MentionType("face-the-nation", "Face the Nation"),
+    MentionType("world-news-tonight", "World News Tonight"),
+    MentionType("earnings", "earnings"),
+    MentionType("trump", "Trump"),
+    MentionType("say", "say"),
+    MentionType("other", "other"),
+)
+MENTION_TYPES: dict[str, MentionType] = {item.id: item for item in MENTION_TYPE_REGISTRY}
+KNOWN_MENTION_TYPE_IDS: tuple[str, ...] = tuple(item.id for item in MENTION_TYPE_REGISTRY)
+
+# CLI shortcuts accepted by --type (case-insensitive).
+MENTION_TYPE_ALIASES: dict[str, str] = {
+    "ftn": "face-the-nation",
+    "wnt": "world-news-tonight",
+    "world-news": "world-news-tonight",
+}
+
+# Ordered (type_id, ticker_regex, title_regex). ticker_regex matches the joined
+# uppercased series/event/market tickers; title_regex matches title/description.
+_TYPE_RULES: tuple[tuple[str, re.Pattern[str], re.Pattern[str] | None], ...] = (
+    (
+        "face-the-nation",
+        re.compile(r"FTNMENTION|FACETHENATION|FACE[_]?THE[_]?NATION", re.IGNORECASE),
+        re.compile(r"\bface\s+the\s+nation\b", re.IGNORECASE),
+    ),
+    (
+        "world-news-tonight",
+        re.compile(r"WORLDNEWSMENTION|WORLDNEWS", re.IGNORECASE),
+        re.compile(r"\bworld\s+news\s+tonight\b", re.IGNORECASE),
+    ),
+    (
+        "earnings",
+        re.compile(r"EARNINGSMENTION|(?=.*\bEARNINGS?\b)(?=.*MENTION)", re.IGNORECASE),
+        re.compile(
+            r"\bearnings?\s+call\b|\bduring\s+their\s+next\s+earnings\b|\bnext\s+earnings\s+call\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "trump",
+        re.compile(r"TRUMPMENTION|TRUMPSAY|\bTRUMP\b.*MENTION|MENTION.*\bTRUMP\b", re.IGNORECASE),
+        re.compile(r"\btrump\b.*\b(?:mention|say|says|said)\b|\b(?:mention|say|says|said)\b.*\btrump\b", re.IGNORECASE),
+    ),
+    (
+        "say",
+        re.compile(r"\bSAY\b|(?<![A-Z])SAY(?![A-Z])|SAYMENTION|[A-Z0-9]*SAY[A-Z0-9]*", re.IGNORECASE),
+        re.compile(
+            r"\bwhat\s+(?:will|would|does|did)\b.{0,120}?\b(?:say|says|said)\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def mention_type_label(type_id: str | None) -> str:
+    """Return the display label for a type id, defaulting to ``other``."""
+    if not type_id:
+        return MENTION_TYPES["other"].label
+    found = MENTION_TYPES.get(str(type_id))
+    return found.label if found is not None else MENTION_TYPES["other"].label
+
+
+def classify_mention_type(
+    *,
+    series_ticker: Any = "",
+    event_ticker: Any = "",
+    title: Any = "",
+    description: Any = "",
+    sub_title: Any = "",
+    category: Any = "",
+    ticker: Any = "",
+) -> MentionType:
+    """Return the primary mention type using ordered deterministic rules."""
+    ticker_blob = " ".join(
+        str(part or "") for part in (series_ticker, event_ticker, ticker)
+    ).upper()
+    title_blob = " ".join(
+        str(part or "") for part in (title, description, sub_title, category)
+    )
+
+    for type_id, ticker_re, title_re in _TYPE_RULES:
+        if ticker_re.search(ticker_blob):
+            return MENTION_TYPES[type_id]
+        if title_re is not None and title_re.search(title_blob):
+            return MENTION_TYPES[type_id]
+    return MENTION_TYPES["other"]
+
+
+def mention_type_for_event(event_like: dict[str, Any]) -> str:
+    """Classify an overview/event-like mapping and return its type id."""
+    if not isinstance(event_like, dict):
+        return MENTION_TYPES["other"].id
+    existing = event_like.get("mention_type")
+    if isinstance(existing, str) and existing in MENTION_TYPES:
+        return existing
+    return classify_mention_type(
+        series_ticker=event_like.get("series_ticker"),
+        event_ticker=event_like.get("event_ticker"),
+        title=event_like.get("title"),
+        description=event_like.get("description"),
+        sub_title=event_like.get("sub_title"),
+        category=event_like.get("category"),
+        ticker=event_like.get("ticker"),
+    ).id
+
+
+def mention_type_for_market(
+    market: dict[str, Any],
+    event: dict[str, Any] | None = None,
+) -> str:
+    """Classify a child market, preferring parent event fields when present."""
+    parent = event if isinstance(event, dict) else {}
+    return classify_mention_type(
+        series_ticker=parent.get("series_ticker") or market.get("series_ticker"),
+        event_ticker=(
+            parent.get("event_ticker")
+            or market.get("event_ticker")
+            or market_event_ticker(market)
+        ),
+        title=parent.get("title") or market.get("title"),
+        description=parent.get("description") or market.get("description"),
+        sub_title=parent.get("sub_title") or market.get("subtitle") or market.get("yes_sub_title"),
+        category=parent.get("category") or market.get("category"),
+        ticker=market.get("ticker"),
+    ).id
+
+
+def format_new_market_email_subject(event_like: dict[str, Any]) -> str:
+    """Build the lock-screen-friendly new-market email subject (MS-0006)."""
+    ticker = str((event_like or {}).get("event_ticker") or "new mention market")
+    type_id = mention_type_for_event(event_like or {})
+    label = (event_like or {}).get("mention_type_label")
+    if not isinstance(label, str) or not label.strip():
+        label = mention_type_label(type_id)
+    return f"[Kalshi] {label} | NEW: {ticker}"
+
+
+def normalize_type_token(token: str) -> str:
+    """Map one CLI type token (id or alias) to a canonical type id."""
+    cleaned = str(token or "").strip().casefold().replace("_", "-")
+    if not cleaned:
+        raise ValueError("empty type token")
+    if cleaned in MENTION_TYPE_ALIASES:
+        return MENTION_TYPE_ALIASES[cleaned]
+    for type_id in KNOWN_MENTION_TYPE_IDS:
+        if type_id.casefold() == cleaned:
+            return type_id
+    raise ValueError(token.strip())
+
+
+def parse_type_filter(raw: str | None) -> frozenset[str] | None:
+    """Parse ``--type`` into a frozenset of ids, or None when unrestricted.
+
+    Raises ``SystemExit`` with an actionable message on empty/invalid input.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        raise SystemExit(
+            "--type requires at least one type id "
+            f"(known: {', '.join(KNOWN_MENTION_TYPE_IDS)})"
+        )
+    tokens = [part.strip() for part in text.split(",") if part.strip()]
+    if not tokens:
+        raise SystemExit(
+            "--type requires at least one type id "
+            f"(known: {', '.join(KNOWN_MENTION_TYPE_IDS)})"
+        )
+    selected: set[str] = set()
+    unknown: list[str] = []
+    for token in tokens:
+        try:
+            selected.add(normalize_type_token(token))
+        except ValueError:
+            unknown.append(token)
+    if unknown:
+        alias_help = ", ".join(sorted(MENTION_TYPE_ALIASES))
+        raise SystemExit(
+            f"Unknown --type value(s): {', '.join(unknown)}. "
+            f"Known: {', '.join(KNOWN_MENTION_TYPE_IDS)}. "
+            f"Aliases: {alias_help}."
+        )
+    return frozenset(selected)
+
+
+def event_matches_types(
+    event_like: dict[str, Any],
+    selected: frozenset[str] | None,
+) -> bool:
+    """Return whether an event passes an any-of type filter (None = all)."""
+    if selected is None:
+        return True
+    return mention_type_for_event(event_like) in selected
+
+
+def market_matches_types(
+    market: dict[str, Any],
+    selected: frozenset[str] | None,
+    event: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether a market's resolved type is in the selected any-of set."""
+    if selected is None:
+        return True
+    return mention_type_for_market(market, event) in selected
+
 
 # Many Kalshi event tickers encode an event date such as ``-26JUN23``. This is
 # a useful date-only fallback when the parent event does not expose strike_date.
@@ -833,6 +1058,7 @@ def market_record(
 ) -> dict[str, Any]:
     close_utc = close_time(market)
     event_utc, event_time_source = event_schedule_for_market(market, event, local_tz)
+    type_id = mention_type_for_market(market, event)
     return {
         "ticker": market.get("ticker"),
         "event_ticker": market_event_ticker(market),
@@ -842,6 +1068,8 @@ def market_record(
         "subtitle": market.get("subtitle"),
         "yes_sub_title": market.get("yes_sub_title"),
         "no_sub_title": market.get("no_sub_title"),
+        "mention_type": type_id,
+        "mention_type_label": mention_type_label(type_id),
         "event_time_utc": iso_utc(event_utc) if event_utc else None,
         "event_time_local": format_local_time(event_utc, local_tz),
         "event_time_source": event_time_source,
@@ -956,13 +1184,25 @@ def event_overviews(
             str(record.get("event_time_source")) for record in event_markets if record.get("event_time_source")
         ))
         statuses = sorted({status_text(record) for record in event_markets})
+        series_ticker = event.get("series_ticker") if isinstance(event.get("series_ticker"), str) else None
+        category = event.get("category") if isinstance(event.get("category"), str) else None
+        type_info = classify_mention_type(
+            series_ticker=series_ticker,
+            event_ticker=event_ticker if event_ticker != "(no event ticker)" else event.get("event_ticker"),
+            title=title,
+            description=description or event.get("description"),
+            sub_title=event.get("sub_title"),
+            category=category,
+        )
         output.append(
             {
                 "event_ticker": event_ticker,
                 "title": title or "Untitled mention event",
                 "description": description or None,
-                "category": event.get("category") if isinstance(event.get("category"), str) else None,
-                "series_ticker": event.get("series_ticker") if isinstance(event.get("series_ticker"), str) else None,
+                "category": category,
+                "series_ticker": series_ticker,
+                "mention_type": type_info.id,
+                "mention_type_label": type_info.label,
                 "contract_count": len(event_markets),
                 "statuses": statuses,
                 "event_times_local": event_times,
@@ -996,6 +1236,10 @@ def render_overview(events: list[dict[str, Any]], colors: bool) -> None:
         sources = ", ".join(str(value) for value in (event.get("event_time_sources") or []))
 
         print(color(event_ticker, "cyan", colors), color(title, "bold", colors))
+        type_label = event.get("mention_type_label") or mention_type_label(
+            event.get("mention_type") or mention_type_for_event(event)
+        )
+        print(f"  type: {color(str(type_label), 'blue', colors)}")
         description = event.get("description")
         if description:
             print(f"  description: {description}")
@@ -1188,11 +1432,15 @@ def format_overview_email(event: dict[str, Any], detected_at: datetime, local_tz
     statuses = ", ".join(str(value) for value in (event.get("statuses") or ["unknown"]))
     market_url = kalshi_event_url(event)
 
+    type_label = event.get("mention_type_label") or mention_type_label(
+        event.get("mention_type") or mention_type_for_event(event)
+    )
     lines = [
         "NEW KALSHI MENTION MARKET",
         "",
         f"Ticker: {event_ticker}",
         f"Title: {title}",
+        f"Type: {type_label}",
     ]
     if market_url:
         lines.append(f"Kalshi market: {market_url}")
@@ -1346,7 +1594,7 @@ def send_new_market_email(
         smtp_server=smtp_server,
         auth_user=auth_user,
         password=password,
-        subject=f"[Kalshi] NEW mention market: {ticker}",
+        subject=format_new_market_email_subject(event),
         body=format_overview_email(event, detected_at, local_tz),
     )
     if verbose:
@@ -1667,6 +1915,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", help="Override the API base URL entirely")
     parser.add_argument("--timezone", default="America/New_York", help="IANA timezone for displayed times and date-only ticker fallback")
     parser.add_argument("--contains", help="Keep only markets whose metadata contains this text")
+    parser.add_argument(
+        "--type",
+        dest="mention_types",
+        metavar="TYPE",
+        help=(
+            "Keep only mention events of these types (comma-separated, any-of). "
+            f"Known: {', '.join(KNOWN_MENTION_TYPE_IDS)}. "
+            "Aliases: ftn, wnt, world-news. Default: all types."
+        ),
+    )
     parser.add_argument("--flat", action="store_true", help="Do not group contracts under their Kalshi event")
     parser.add_argument("--overview", action="store_true", help="Show one parent event title/description block and hide individual word/outcome contracts")
     parser.add_argument("--json", action="store_true", help="Write machine-readable JSON to stdout")
@@ -1769,6 +2027,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     original_argv = sys.argv[1:]
     args = build_parser().parse_args()
+    # Fail fast on invalid --type before any network/cache work (including watch).
+    selected_types = parse_type_filter(getattr(args, "mention_types", None))
+    args.selected_mention_types = selected_types
     if args.test_email:
         if args.watch_new or args.email_new or args.queue_initialized:
             raise SystemExit("--test-email sends once and cannot be combined with --watch-new, --email-new, or --queue-initialized")
@@ -1905,6 +2166,8 @@ def main() -> int:
     # Full mode starts with every market; compact mode already consists only of
     # mention candidates. Keep the final predicate in both modes for backwards
     # compatible --contains/classification behavior and safety against stale data.
+    # Type filter is applied after parent metadata is available (below) so series
+    # tickers can drive the deterministic taxonomy.
     mention_markets = [
         market
         for market in cached_markets
@@ -1944,6 +2207,14 @@ def main() -> int:
         detail = event_details.get(str(market_event_ticker(market) or ""), {})
         event = detail.get("event") if isinstance(detail, dict) else None
         return event if isinstance(event, dict) else None
+
+    # AND with --contains (already applied): any-of type filter at parent/event level.
+    if selected_types is not None:
+        mention_markets = [
+            market
+            for market in mention_markets
+            if market_matches_types(market, selected_types, event_for(market))
+        ]
 
     def on_event_day(market: dict[str, Any]) -> bool:
         when, _source = event_schedule_for_market(market, event_for(market), local_tz)
@@ -2033,6 +2304,8 @@ def main() -> int:
     print(f"data: {cache_note}  |  cache file: {cache_path}")
     if args.contains:
         print(f"contains: {args.contains!r}")
+    if selected_types is not None:
+        print(f"type: {', '.join(sorted(selected_types))}")
     print()
 
     if not records:
