@@ -3,6 +3,9 @@ Description=Kalshi mention-scout watch (user)
 Documentation=file://@REPO_ROOT@/README.md
 After=network-online.target
 Wants=network-online.target
+# Rate-limit automatic restarts (must live in [Unit], not [Service])
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -10,9 +13,6 @@ WorkingDirectory=@REPO_ROOT@
 ExecStart=@PYTHON@ @ENTRY@ --watch-new --email-new
 Restart=on-failure
 RestartSec=30
-# Avoid tight crash loops if configuration is broken
-StartLimitIntervalSec=300
-StartLimitBurst=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=mention-scout-watch

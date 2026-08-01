@@ -180,3 +180,18 @@ def test_missing_entry_fails(tmp_path: Path) -> None:
     proc = _run_installer("--dry-run", "--repo-root", str(fake_root))
     assert proc.returncode != 0
     assert "Stable entry not found" in (proc.stderr + proc.stdout)
+
+
+def test_start_limit_keys_live_in_unit_section():
+    """StartLimit* must be under [Unit]; systemd ignores them under [Service]."""
+    from pathlib import Path
+    template = Path(__file__).resolve().parents[1] / "deploy/systemd/mention-scout-watch.service"
+    text = template.read_text()
+    unit_section = text.split("[Service]", 1)[0]
+    service_section = text.split("[Service]", 1)[1].split("[Install]", 1)[0]
+    assert "StartLimitIntervalSec=300" in unit_section
+    assert "StartLimitBurst=5" in unit_section
+    assert "StartLimitIntervalSec" not in service_section
+    assert "StartLimitBurst" not in service_section
+    assert "Restart=on-failure" in service_section
+    assert "RestartSec=30" in service_section
