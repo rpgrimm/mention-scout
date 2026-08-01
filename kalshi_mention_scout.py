@@ -596,9 +596,9 @@ def scan_mention_events(
         nested_markets = [item for item in markets if isinstance(item, dict)] if isinstance(markets, list) else []
 
         # Some parent events are unambiguously mention markets from their
-        # ticker/title. Others are recognized from the child market text/rules,
-        # retaining compatibility with the older full-market classifier.
-        matches_event = is_mention_event(event) or any(is_mention_market(item) for item in nested_markets)
+        # ticker/title. Others are recognized from nested child product text
+        # (ticker/title/subtitles — not settlement rules; see MS-0007).
+        matches_event = event_qualifies_as_mention(event, nested_markets)
         if not matches_event:
             continue
 
@@ -873,6 +873,12 @@ def closes_in_window(market: dict[str, Any], start: datetime, end: datetime) -> 
 
 
 def text_for_market(market: dict[str, Any]) -> str:
+    """Full market text for --contains and human/rules display sources.
+
+    Includes settlement rules so substring search can still find legal prose.
+    Binary mention admission must NOT use this string (see
+    mention_gate_text_for_market / MS-0007).
+    """
     fields = (
         "ticker",
         "event_ticker",
@@ -886,12 +892,38 @@ def text_for_market(market: dict[str, Any]) -> str:
     return "\n".join(str(market.get(field, "")) for field in fields)
 
 
+def mention_gate_text_for_market(market: dict[str, Any]) -> str:
+    """Product-facing market text for binary mention discovery membership.
+
+    Excludes rules_primary / rules_secondary so settlement boilerplate cannot
+    alone admit a market (MS-0007). Keep text_for_market for contains/display.
+    """
+    fields = (
+        "ticker",
+        "event_ticker",
+        "title",
+        "subtitle",
+        "yes_sub_title",
+        "no_sub_title",
+    )
+    return "\n".join(str(market.get(field, "")) for field in fields)
+
+
 def is_mention_market(market: dict[str, Any]) -> bool:
     ticker_text = f"{market.get('ticker', '')} {market.get('event_ticker', '')}".upper()
     if "MENTION" in ticker_text:
         return True
-    text = text_for_market(market)
+    text = mention_gate_text_for_market(market)
     return bool(MENTION_RE.search(text) or SAY_EVENT_RE.search(text))
+
+
+def event_qualifies_as_mention(
+    event: dict[str, Any],
+    nested_markets: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Pure helper mirroring scan_mention_events admission boolean (no HTTP)."""
+    children = nested_markets if nested_markets is not None else []
+    return is_mention_event(event) or any(is_mention_market(item) for item in children)
 
 
 def contains_filter(market: dict[str, Any], needle: str | None) -> bool:
