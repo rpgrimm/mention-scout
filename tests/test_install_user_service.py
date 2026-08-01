@@ -184,11 +184,17 @@ def test_missing_entry_fails(tmp_path: Path) -> None:
 
 def test_start_limit_keys_live_in_unit_section():
     """StartLimit* must be under [Unit]; systemd ignores them under [Service]."""
+    import re
     from pathlib import Path
+
     template = Path(__file__).resolve().parents[1] / "deploy/systemd/mention-scout-watch.service"
     text = template.read_text()
-    unit_section = text.split("[Service]", 1)[0]
-    service_section = text.split("[Service]", 1)[1].split("[Install]", 1)[0]
+    # Match real section headers only (start of line).
+    unit_match = re.search(r"(?ms)^\[Unit\]\s*(.*?)(?=^\[Service\])", text)
+    service_match = re.search(r"(?ms)^\[Service\]\s*(.*?)(?=^\[Install\])", text)
+    assert unit_match and service_match
+    unit_section = unit_match.group(1)
+    service_section = service_match.group(1)
     assert "StartLimitIntervalSec=300" in unit_section
     assert "StartLimitBurst=5" in unit_section
     assert "StartLimitIntervalSec" not in service_section

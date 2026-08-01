@@ -3,7 +3,7 @@ Description=Kalshi mention-scout watch (user)
 Documentation=file://@REPO_ROOT@/README.md
 After=network-online.target
 Wants=network-online.target
-# Rate-limit automatic restarts (must live in [Unit], not [Service])
+# Rate-limit automatic restarts (systemd.unit: StartLimit* belong in Unit section)
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
