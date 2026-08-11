@@ -9,4 +9,10 @@ dist/
 .env.*
 !.env.example
 .kalshi_mention_scout_*cache*.json
+# Google Calendar / local owner config (never commit secrets or tokens)
+client_secret.json
+token.json
+**/client_secret.json
+**/token.json
+.calendar-added.json
 # END OPENCLAW SOFTWARE FACTORY

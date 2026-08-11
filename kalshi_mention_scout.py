@@ -44,6 +44,10 @@ Changes in v16:
   * Adds a clickable Kalshi event-page URL to new-market notification emails.
     The URL uses any explicit Kalshi URL field when present; otherwise it is
     built from the parent series/event ticker and a safe title slug.
+  * MS-0010: optional --calendar-add-new for --watch-new creates Google Calendar
+    events when a new parent event matches owner phrases in
+    ~/.config/mention-scout/calendar-matches.json. Includes --calendar-auth,
+    local dedupe state, and calendar error emails via the existing swaks path.
 
 Changes in v15:
   * Adds Gmail credential loading from ``~/.config/.google-password`` for
@@ -94,7 +98,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -108,6 +112,17 @@ DEFAULT_CACHE_TTL_SECONDS = 300.0
 DEFAULT_OPEN_QUEUE_DIR = "mention_open_queue"
 QUEUE_FORMAT_VERSION = 1
 DEFAULT_GOOGLE_PASSWORD_FILE = Path("~/.config/.google-password")
+DEFAULT_MENTION_SCOUT_CONFIG_DIR = Path("~/.config/mention-scout")
+DEFAULT_CALENDAR_MATCHES_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "calendar-matches.json"
+DEFAULT_CALENDAR_CLIENT_SECRET_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "client_secret.json"
+DEFAULT_CALENDAR_TOKEN_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "token.json"
+DEFAULT_CALENDAR_STATE_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "calendar-added.json"
+DEFAULT_CALENDAR_ID = "primary"
+DEFAULT_CALENDAR_DURATION_MINUTES = 60
+CALENDAR_MATCH_FILE_VERSION = 1
+CALENDAR_STATE_FILE_VERSION = 1
+CALENDAR_OAUTH_SCOPES = ("https://www.googleapis.com/auth/calendar.events",)
+CALENDAR_ERROR_BODY_LIMIT = 1200
 
 BASE_URLS = {
     "prod": "https://api.elections.kalshi.com/trade-api/v2",
@@ -1358,30 +1373,46 @@ def _watch_child_arguments(original_argv: list[str]) -> list[str]:
     """
     child: list[str] = []
     skip_next = False
+    # Parent-process-only flags (watch side effects / auth / SMTP / calendar).
+    strip_flags = {
+        "--watch-new",
+        "--email-new",
+        "--queue-initialized",
+        "--test-email",
+        "--calendar-add-new",
+        "--calendar-auth",
+    }
+    strip_value_flags = {
+        "--poll-seconds",
+        "--email-to",
+        "--email-from",
+        "--smtp-server",
+        "--smtp-auth-user",
+        "--queue-dir",
+        "--google-password-file",
+        "--calendar-matches",
+        "--calendar-client-secret",
+        "--calendar-token",
+        "--calendar-id",
+        "--calendar-state",
+        "--calendar-duration-minutes",
+    }
+    strip_prefixes = tuple(f"{name}=" for name in strip_value_flags)
     for token in original_argv:
         if skip_next:
             skip_next = False
             continue
-        if token in ("--watch-new", "--email-new", "--queue-initialized"):
+        if token in strip_flags:
             continue
-        if token in (
-            "--poll-seconds",
-            "--email-to",
-            "--email-from",
-            "--smtp-server",
-            "--smtp-auth-user",
-            "--queue-dir",
-        ):
+        if token in strip_value_flags:
             skip_next = True
             continue
-        if token.startswith((
-            "--poll-seconds=",
-            "--email-to=",
-            "--email-from=",
-            "--smtp-server=",
-            "--smtp-auth-user=",
-            "--queue-dir=",
-        )):
+        if token.startswith(strip_prefixes):
+            continue
+        # Defense-in-depth: drop any future/unknown --calendar-* parent flags.
+        if token == "--calendar" or token.startswith("--calendar-"):
+            if "=" not in token:
+                skip_next = True
             continue
         child.append(token)
 
@@ -1602,6 +1633,782 @@ def run_swaks_email(
         raise RuntimeError(f"swaks failed: {detail[:600]}")
 
 
+# ---------------------------------------------------------------------------
+# Google Calendar auto-add (MS-0010)
+# ---------------------------------------------------------------------------
+
+
+class CalendarClient(Protocol):
+    """Minimal calendar insert surface used by watch mode and unit tests."""
+
+    def insert_event(self, calendar_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Create one calendar event and return the API-like response dict."""
+
+
+class CalendarMatchCache:
+    """Load and cache owner match phrases, reloading when the file mtime changes."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path.expanduser()
+        self._mtime_ns: int | None = None
+        self._phrases: tuple[str, ...] = ()
+
+    def get_phrases(self) -> list[str]:
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"calendar match file is missing: {self.path}. "
+                "Copy deploy/config/calendar-matches.example.json to that path "
+                "and edit the phrases list."
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(f"cannot read calendar match file {self.path}: {exc}") from exc
+
+        if self._mtime_ns is not None and stat.st_mtime_ns == self._mtime_ns:
+            return list(self._phrases)
+
+        phrases = load_calendar_match_phrases(self.path)
+        self._phrases = tuple(phrases)
+        self._mtime_ns = stat.st_mtime_ns
+        return list(self._phrases)
+
+
+def _require_google_calendar_libs() -> tuple[Any, Any, Any, Any]:
+    """Import optional Google client libraries or raise an actionable error."""
+    try:
+        from google.auth.transport.requests import Request as GoogleAuthRequest
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+    except ImportError as exc:
+        raise RuntimeError(
+            "Google Calendar support requires optional packages. Install with:\n"
+            "  python3 -m pip install google-auth google-auth-oauthlib google-api-python-client\n"
+            f"Original import error: {exc}"
+        ) from exc
+    return Credentials, InstalledAppFlow, build, GoogleAuthRequest
+
+
+def load_calendar_match_phrases(path: Path) -> list[str]:
+    """Load and validate the owner calendar match JSON file.
+
+    Schema (v1)::
+
+        {"version": 1, "phrases": ["abc world news tonight", ...]}
+
+    Phrases are trimmed, case-preserved for display, de-duplicated casefold,
+    and must be non-empty after trim.
+    """
+    match_path = path.expanduser()
+    try:
+        raw_text = match_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"calendar match file is missing: {match_path}. "
+            "Copy deploy/config/calendar-matches.example.json to that path "
+            "and edit the phrases list."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"cannot read calendar match file {match_path}: {exc}") from exc
+
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"calendar match file is not valid JSON ({match_path}): {exc.msg} "
+            f"at line {exc.lineno} column {exc.colno}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"calendar match file must be a JSON object with version/phrases: {match_path}"
+        )
+    version = payload.get("version")
+    if version != CALENDAR_MATCH_FILE_VERSION:
+        raise RuntimeError(
+            f"calendar match file version must be {CALENDAR_MATCH_FILE_VERSION} "
+            f"(got {version!r}) in {match_path}"
+        )
+    if "phrases" not in payload:
+        raise RuntimeError(f"calendar match file is missing 'phrases' array: {match_path}")
+    phrases_raw = payload.get("phrases")
+    if not isinstance(phrases_raw, list):
+        raise RuntimeError(f"calendar match file 'phrases' must be a JSON array: {match_path}")
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(phrases_raw):
+        if not isinstance(item, str):
+            raise RuntimeError(
+                f"calendar match phrase at index {index} must be a string in {match_path}"
+            )
+        phrase = item.strip()
+        if not phrase:
+            raise RuntimeError(
+                f"calendar match phrase at index {index} is empty after trim in {match_path}"
+            )
+        key = phrase.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(phrase)
+
+    if not cleaned:
+        raise RuntimeError(
+            f"calendar match file has no usable phrases after trim/dedupe: {match_path}"
+        )
+    return cleaned
+
+
+def event_calendar_haystack(
+    event: dict[str, Any],
+    records: list[dict[str, Any]] | None = None,
+) -> str:
+    """Build casefold match text from parent overview fields + child titles/tickers.
+
+    Intentionally omits settlement rules boilerplate (false-positive magnet).
+    """
+    parts: list[str] = []
+    for field in (
+        "title",
+        "sub_title",
+        "subtitle",
+        "description",
+        "category",
+        "event_ticker",
+        "series_ticker",
+    ):
+        value = event.get(field)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        for field in ("title", "subtitle", "yes_sub_title", "no_sub_title", "ticker", "event_ticker"):
+            value = record.get(field)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+
+    return " ".join(parts).casefold()
+
+
+def matching_calendar_phrases(haystack: str, phrases: Iterable[str]) -> list[str]:
+    """Return owner phrases that are case-insensitive substrings of ``haystack``.
+
+    ``haystack`` should already be casefolded (see event_calendar_haystack).
+    Returned phrases preserve the owner's original spelling/casing from the file.
+    """
+    text = haystack if haystack == haystack.casefold() else haystack.casefold()
+    hits: list[str] = []
+    seen: set[str] = set()
+    for phrase in phrases:
+        cleaned = str(phrase).strip()
+        if not cleaned:
+            continue
+        key = cleaned.casefold()
+        if key in seen:
+            continue
+        if key in text:
+            seen.add(key)
+            hits.append(cleaned)
+    return hits
+
+
+def calendar_dedupe_key(event_ticker: str, calendar_id: str) -> str:
+    """Stable local-state key for one parent event on one calendar."""
+    return f"{str(event_ticker).strip()}::{str(calendar_id).strip() or DEFAULT_CALENDAR_ID}"
+
+
+def load_calendar_added_state(path: Path) -> dict[str, Any]:
+    """Load calendar dedupe state, or an empty v1 document when missing."""
+    state_path = path.expanduser()
+    if not state_path.exists():
+        return {"version": CALENDAR_STATE_FILE_VERSION, "entries": {}}
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"calendar state file is not valid JSON ({state_path}): {exc.msg}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"cannot read calendar state file {state_path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"calendar state file must be a JSON object: {state_path}")
+    entries = payload.get("entries")
+    if entries is None:
+        entries = {}
+    if not isinstance(entries, dict):
+        raise RuntimeError(f"calendar state file 'entries' must be an object: {state_path}")
+    return {
+        "version": int(payload.get("version") or CALENDAR_STATE_FILE_VERSION),
+        "entries": dict(entries),
+    }
+
+
+def save_calendar_added_state(path: Path, state: dict[str, Any]) -> None:
+    """Atomically persist calendar dedupe state."""
+    payload = {
+        "version": int(state.get("version") or CALENDAR_STATE_FILE_VERSION),
+        "entries": dict(state.get("entries") or {}),
+    }
+    write_cache_atomic(path.expanduser(), payload)
+
+
+def calendar_already_added(state: dict[str, Any], event_ticker: str, calendar_id: str) -> bool:
+    """Return whether local state already recorded a successful insert."""
+    entries = state.get("entries") if isinstance(state, dict) else None
+    if not isinstance(entries, dict):
+        return False
+    return calendar_dedupe_key(event_ticker, calendar_id) in entries
+
+
+def mark_calendar_added(
+    state: dict[str, Any],
+    *,
+    event_ticker: str,
+    calendar_id: str,
+    added_at_utc: str,
+    calendar_event_id: str | None = None,
+    html_link: str | None = None,
+    matched_phrase: str | None = None,
+    kind: str = "event",
+) -> dict[str, Any]:
+    """Record a successful insert or a deduped error outcome in local state."""
+    if not isinstance(state.get("entries"), dict):
+        state["entries"] = {}
+    key = calendar_dedupe_key(event_ticker, calendar_id)
+    entry: dict[str, Any] = {
+        "added_at_utc": added_at_utc,
+        "kind": kind,
+    }
+    if calendar_event_id:
+        entry["calendar_event_id"] = calendar_event_id
+    if html_link:
+        entry["html_link"] = html_link
+    if matched_phrase:
+        entry["matched_phrase"] = matched_phrase
+    state["entries"][key] = entry
+    return state
+
+
+def _schedule_is_date_only(_event_local: datetime, source: str) -> bool:
+    """Return True when the schedule source is date-only (no reliable clock time)."""
+    source_l = source.casefold()
+    if "exact time unavailable" in source_l:
+        return True
+    return any(
+        token in source_l
+        for token in (
+            "strike_date",
+            "event_date",
+            "scheduled_date",
+            "ticker date",
+            "kalshi event date",
+        )
+    )
+
+
+def resolve_calendar_schedule(
+    event: dict[str, Any],
+    records: list[dict[str, Any]],
+    local_tz: ZoneInfo,
+) -> tuple[datetime | None, str, bool]:
+    """Resolve start time/date for a calendar row from overview + child records.
+
+    Returns ``(start_utc_or_none, source_label, is_date_only)``.
+    """
+    first_iso = event.get("first_event_time_utc")
+    parsed = parse_iso(first_iso) if isinstance(first_iso, str) else None
+    sources = event.get("event_time_sources") or []
+    source = str(sources[0]) if sources else "event overview"
+
+    if parsed is None:
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            candidate = parse_iso(record.get("event_time_utc"))
+            if candidate is not None:
+                parsed = candidate
+                source = str(record.get("event_time_source") or source)
+                break
+
+    if parsed is None:
+        return None, "no event date supplied", False
+
+    date_only = _schedule_is_date_only(parsed.astimezone(local_tz), source)
+    return parsed, source, date_only
+
+
+def build_calendar_event_body(
+    event: dict[str, Any],
+    *,
+    matched_phrases: list[str],
+    local_tz: ZoneInfo,
+    duration_minutes: int,
+    detected_at: datetime,
+    records: list[dict[str, Any]] | None = None,
+    schedule: tuple[datetime | None, str, bool] | None = None,
+) -> dict[str, Any]:
+    """Build a Google Calendar events.insert body for one parent mention event.
+
+    Raises RuntimeError when no usable schedule exists (caller should email).
+    """
+    if duration_minutes <= 0:
+        raise RuntimeError("--calendar-duration-minutes must be greater than zero")
+
+    records = records or []
+    if schedule is None:
+        start_utc, source, date_only = resolve_calendar_schedule(event, records, local_tz)
+    else:
+        start_utc, source, date_only = schedule
+
+    if start_utc is None:
+        raise RuntimeError(
+            "no usable event schedule for calendar insert "
+            f"(ticker={event.get('event_ticker')!r}; source={source})"
+        )
+
+    title = clean_display_text(event.get("title")) or clean_display_text(event.get("event_ticker")) or "Untitled mention event"
+    type_label = clean_display_text(event.get("mention_type_label"))
+    if type_label and type_label.casefold() not in {"", "other"}:
+        summary = f"[Kalshi] {type_label}: {title}"
+    else:
+        summary = f"[Kalshi] {title}"
+
+    event_ticker = clean_display_text(event.get("event_ticker")) or "(no event ticker)"
+    description_bits = [
+        f"Event ticker: {event_ticker}",
+        f"Matched phrase(s): {', '.join(matched_phrases) if matched_phrases else '(none)'}",
+    ]
+    if type_label:
+        description_bits.append(f"Mention type: {type_label}")
+    url = kalshi_event_url(event)
+    if url:
+        description_bits.append(f"Kalshi: {url}")
+    desc = clean_display_text(event.get("description"))
+    if desc:
+        description_bits.append("")
+        description_bits.append(desc)
+    description_bits.extend(
+        [
+            "",
+            f"Schedule source: {source}",
+            f"Detected: {format_local_time(detected_at, local_tz)}",
+            "Created by mention-scout --watch-new --calendar-add-new.",
+        ]
+    )
+
+    body: dict[str, Any] = {
+        "summary": summary,
+        "description": "\n".join(description_bits),
+    }
+    if url:
+        body["source"] = {"title": "Kalshi", "url": url}
+
+    local_start = start_utc.astimezone(local_tz)
+    if date_only:
+        day = local_start.date()
+        body["start"] = {"date": day.isoformat()}
+        body["end"] = {"date": (day + timedelta(days=1)).isoformat()}
+    else:
+        end_local = local_start + timedelta(minutes=duration_minutes)
+        body["start"] = {
+            "dateTime": local_start.isoformat(),
+            "timeZone": getattr(local_tz, "key", str(local_tz)),
+        }
+        body["end"] = {
+            "dateTime": end_local.isoformat(),
+            "timeZone": getattr(local_tz, "key", str(local_tz)),
+        }
+    return body
+
+
+def format_calendar_error_email(
+    *,
+    operation: str,
+    error: str,
+    detected_at: datetime,
+    local_tz: ZoneInfo,
+    event: dict[str, Any] | None = None,
+    matched_phrases: list[str] | None = None,
+    paths: dict[str, Path | str] | None = None,
+) -> tuple[str, str]:
+    """Build subject/body for a calendar failure notification (no secrets)."""
+    event = event or {}
+    ticker = clean_display_text(event.get("event_ticker")) or "watch"
+    title = clean_display_text(event.get("title"))
+    subject = f"[Kalshi] calendar error | {ticker}"
+    err_text = " ".join(str(error).split())
+    if len(err_text) > CALENDAR_ERROR_BODY_LIMIT:
+        err_text = err_text[: CALENDAR_ERROR_BODY_LIMIT - 3] + "..."
+
+    lines = [
+        "Kalshi mention-scout Google Calendar error",
+        "",
+        f"Detected: {format_local_time(detected_at, local_tz)}",
+        f"Operation: {operation}",
+        f"Event ticker: {ticker}",
+    ]
+    if title:
+        lines.append(f"Title: {title}")
+    if matched_phrases:
+        lines.append(f"Matched phrase(s): {', '.join(matched_phrases)}")
+    lines.extend(["", f"Error: {err_text}", ""])
+    if paths:
+        lines.append("Expected paths (contents never emailed):")
+        for label, path in paths.items():
+            lines.append(f"  - {label}: {path}")
+        lines.append("")
+    lines.extend(
+        [
+            "Remediation ideas:",
+            "  - Fix/create ~/.config/mention-scout/calendar-matches.json (see deploy/config example)",
+            "  - Ensure client_secret.json exists and run: ./mention_scout.py --calendar-auth",
+            "  - chmod 600 client_secret.json token.json",
+            "  - Enable the Google Calendar API for the OAuth desktop client project",
+            "",
+            "This alert is generated by mention-scout --calendar-add-new.",
+        ]
+    )
+    return subject, "\n".join(lines)
+
+
+def _path_mode_too_open(path: Path) -> bool:
+    try:
+        return bool(path.stat().st_mode & 0o077)
+    except OSError:
+        return False
+
+
+def load_google_calendar_credentials(
+    *,
+    client_secret_path: Path,
+    token_path: Path,
+    allow_interactive: bool = False,
+) -> Any:
+    """Load OAuth credentials; optionally run installed-app consent once."""
+    Credentials, InstalledAppFlow, _build, GoogleAuthRequest = _require_google_calendar_libs()
+    secret = client_secret_path.expanduser()
+    token = token_path.expanduser()
+
+    if not secret.is_file():
+        raise RuntimeError(
+            f"Google OAuth client secret is missing: {secret}. "
+            "Download a Desktop OAuth client JSON from Google Cloud Console into that path."
+        )
+    if _path_mode_too_open(secret):
+        raise RuntimeError(
+            f"Google OAuth client secret permissions are too broad: {secret} "
+            "(run: chmod 600 ~/.config/mention-scout/client_secret.json)"
+        )
+
+    creds = None
+    if token.exists():
+        if not token.is_file():
+            raise RuntimeError(f"Google OAuth token path is not a regular file: {token}")
+        if _path_mode_too_open(token):
+            raise RuntimeError(
+                f"Google OAuth token permissions are too broad: {token} "
+                "(run: chmod 600 ~/.config/mention-scout/token.json)"
+            )
+        try:
+            creds = Credentials.from_authorized_user_file(str(token), list(CALENDAR_OAUTH_SCOPES))
+        except Exception as exc:  # noqa: BLE001 - surface any token parse failure cleanly
+            raise RuntimeError(
+                f"could not load Google OAuth token from {token}: {exc}. "
+                "Re-run ./mention_scout.py --calendar-auth"
+            ) from exc
+
+    if creds and creds.valid:
+        return creds
+
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(GoogleAuthRequest())
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"Google OAuth token refresh failed: {exc}. "
+                "Re-run ./mention_scout.py --calendar-auth"
+            ) from exc
+        _write_authorized_user_token(token, creds)
+        return creds
+
+    if not allow_interactive:
+        raise RuntimeError(
+            f"Google OAuth token is missing or unusable: {token}. "
+            "Run ./mention_scout.py --calendar-auth once on a machine with a browser, "
+            "then copy token.json into place for headless watch."
+        )
+
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(str(secret), list(CALENDAR_OAUTH_SCOPES))
+        creds = flow.run_local_server(port=0)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Google OAuth interactive auth failed: {exc}") from exc
+
+    _write_authorized_user_token(token, creds)
+    return creds
+
+
+def _write_authorized_user_token(token_path: Path, creds: Any) -> None:
+    """Persist refreshed/new user credentials with restrictive permissions."""
+    path = token_path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = creds.to_json() if hasattr(creds, "to_json") else json.dumps({
+        "token": getattr(creds, "token", None),
+        "refresh_token": getattr(creds, "refresh_token", None),
+        "token_uri": getattr(creds, "token_uri", None),
+        "client_id": getattr(creds, "client_id", None),
+        "client_secret": getattr(creds, "client_secret", None),
+        "scopes": list(getattr(creds, "scopes", []) or []),
+    })
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload if isinstance(payload, str) else json.dumps(payload))
+            handle.write("\n")
+        os.replace(tmp_path, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+class GoogleCalendarApiClient:
+    """Thin wrapper around googleapiclient Calendar events.insert."""
+
+    def __init__(self, service: Any, *, timeout_seconds: float = 20.0) -> None:
+        self._service = service
+        self._timeout_seconds = timeout_seconds
+
+    @classmethod
+    def from_credentials(cls, credentials: Any, *, timeout_seconds: float = 20.0) -> "GoogleCalendarApiClient":
+        _Credentials, _Flow, build, _Request = _require_google_calendar_libs()
+        # cache_discovery=False avoids writing discovery docs into homedir unexpectedly.
+        service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+        return cls(service, timeout_seconds=timeout_seconds)
+
+    def insert_event(self, calendar_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            request = self._service.events().insert(calendarId=calendar_id, body=body)
+            # google-api-python-client supports num_retries on execute.
+            result = request.execute(num_retries=2)
+        except Exception as exc:  # noqa: BLE001 - normalize all API failures
+            raise RuntimeError(f"Google Calendar API insert failed: {exc}") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError("Google Calendar API insert returned a non-object response")
+        return result
+
+
+def run_calendar_auth(args: argparse.Namespace) -> int:
+    """One-shot interactive OAuth; write token.json and exit."""
+    try:
+        load_google_calendar_credentials(
+            client_secret_path=args.calendar_client_secret,
+            token_path=args.calendar_token,
+            allow_interactive=True,
+        )
+    except RuntimeError as exc:
+        raise SystemExit(f"calendar auth failed: {exc}") from exc
+    token_path = args.calendar_token.expanduser()
+    print(f"calendar auth ok; token written to {token_path}", flush=True)
+    return 0
+
+
+def verify_calendar_configuration(args: argparse.Namespace) -> tuple[CalendarMatchCache, Any, dict[str, Any]]:
+    """Fail-fast preflight for --calendar-add-new (secret/token/match/state/deps)."""
+    # Import / secret / token checks first so missing optional deps fail loudly.
+    credentials = load_google_calendar_credentials(
+        client_secret_path=args.calendar_client_secret,
+        token_path=args.calendar_token,
+        allow_interactive=False,
+    )
+    match_cache = CalendarMatchCache(args.calendar_matches)
+    # Validate match file immediately (and populate mtime cache).
+    match_cache.get_phrases()
+    state = load_calendar_added_state(args.calendar_state)
+    return match_cache, credentials, state
+
+
+def send_calendar_error_email(
+    args: argparse.Namespace,
+    *,
+    password: str,
+    operation: str,
+    error: str,
+    detected_at: datetime,
+    local_tz: ZoneInfo,
+    event: dict[str, Any] | None = None,
+    matched_phrases: list[str] | None = None,
+    verbose: bool = False,
+) -> None:
+    """Email a calendar failure through the existing swaks path."""
+    subject, body = format_calendar_error_email(
+        operation=operation,
+        error=error,
+        detected_at=detected_at,
+        local_tz=local_tz,
+        event=event,
+        matched_phrases=matched_phrases,
+        paths={
+            "matches": args.calendar_matches.expanduser(),
+            "client_secret": args.calendar_client_secret.expanduser(),
+            "token": args.calendar_token.expanduser(),
+            "state": args.calendar_state.expanduser(),
+        },
+    )
+    run_swaks_email(
+        recipient=args.email_to,
+        sender=args.email_from,
+        smtp_server=args.smtp_server,
+        auth_user=args.smtp_auth_user,
+        password=password,
+        subject=subject,
+        body=body,
+    )
+    if verbose:
+        ticker = clean_display_text((event or {}).get("event_ticker")) or "watch"
+        print(f"calendar error email sent for {ticker} to {args.email_to}", file=sys.stderr, flush=True)
+
+
+def maybe_add_calendar_event_for_new_market(
+    *,
+    args: argparse.Namespace,
+    event: dict[str, Any],
+    records: list[dict[str, Any]],
+    detected_at: datetime,
+    local_tz: ZoneInfo,
+    match_cache: CalendarMatchCache,
+    calendar_client: CalendarClient,
+    state: dict[str, Any],
+    email_password: str,
+    colors: bool,
+) -> dict[str, Any]:
+    """Phrase-match a new parent event and insert one calendar row when eligible.
+
+    Returns the (possibly updated) dedupe state. Never raises for per-event
+    failures: errors go to stderr + optional error email, then watch continues.
+    """
+    ticker = clean_display_text(event.get("event_ticker")) or ""
+    calendar_id = str(args.calendar_id or DEFAULT_CALENDAR_ID)
+
+    def _fail(operation: str, exc: Exception, matched: list[str] | None = None, dedupe_error: bool = False) -> dict[str, Any]:
+        message = str(exc)
+        print(
+            color(f"calendar alert failed for {ticker or 'event'}: {message}", "red", colors),
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            send_calendar_error_email(
+                args,
+                password=email_password,
+                operation=operation,
+                error=message,
+                detected_at=detected_at,
+                local_tz=local_tz,
+                event=event,
+                matched_phrases=matched,
+                verbose=bool(args.verbose),
+            )
+        except RuntimeError as mail_exc:
+            print(
+                color(f"calendar error email failed for {ticker or 'event'}: {mail_exc}", "red", colors),
+                file=sys.stderr,
+                flush=True,
+            )
+        if dedupe_error and ticker:
+            mark_calendar_added(
+                state,
+                event_ticker=ticker,
+                calendar_id=calendar_id,
+                added_at_utc=iso_utc(detected_at),
+                matched_phrase=(matched[0] if matched else None),
+                kind="error",
+            )
+            try:
+                save_calendar_added_state(args.calendar_state, state)
+            except OSError as save_exc:
+                print(
+                    color(f"calendar state save failed for {ticker}: {save_exc}", "red", colors),
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return state
+
+    if not ticker:
+        return _fail("calendar-match", RuntimeError("new event is missing event_ticker"))
+
+    if calendar_already_added(state, ticker, calendar_id):
+        if args.verbose:
+            print(f"calendar skip (already added): {ticker}", file=sys.stderr, flush=True)
+        return state
+
+    try:
+        phrases = match_cache.get_phrases()
+    except RuntimeError as exc:
+        return _fail("match-file", exc)
+
+    haystack = event_calendar_haystack(event, records)
+    matched = matching_calendar_phrases(haystack, phrases)
+    if not matched:
+        if args.verbose:
+            print(f"calendar skip (no phrase match): {ticker}", file=sys.stderr, flush=True)
+        return state
+
+    try:
+        body = build_calendar_event_body(
+            event,
+            matched_phrases=matched,
+            local_tz=local_tz,
+            duration_minutes=int(args.calendar_duration_minutes),
+            detected_at=detected_at,
+            records=records,
+        )
+    except RuntimeError as exc:
+        # Missing schedule: email once per ticker via error-kind dedupe entry.
+        return _fail("schedule", exc, matched=matched, dedupe_error=True)
+
+    try:
+        result = calendar_client.insert_event(calendar_id, body)
+    except RuntimeError as exc:
+        return _fail("insert", exc, matched=matched)
+
+    mark_calendar_added(
+        state,
+        event_ticker=ticker,
+        calendar_id=calendar_id,
+        added_at_utc=iso_utc(detected_at),
+        calendar_event_id=str(result.get("id") or "") or None,
+        html_link=str(result.get("htmlLink") or "") or None,
+        matched_phrase=matched[0],
+        kind="event",
+    )
+    try:
+        save_calendar_added_state(args.calendar_state, state)
+    except OSError as exc:
+        print(
+            color(f"calendar state save failed after insert for {ticker}: {exc}", "red", colors),
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(
+            color(f"calendar event added for {ticker} (matched {matched[0]!r})", "green", colors),
+            flush=True,
+        )
+    return state
+
+
 def verify_email_configuration(args: argparse.Namespace) -> str:
     """Fail fast and return the Gmail app password for this process."""
     return load_google_password(args.google_password_file)
@@ -1770,6 +2577,23 @@ def watch_new_events(args: argparse.Namespace, original_argv: list[str]) -> int:
         except RuntimeError as exc:
             raise SystemExit(f"email configuration error: {exc}") from exc
 
+    calendar_match_cache = None
+    calendar_client = None
+    calendar_state: dict[str, Any] | None = None
+    if args.calendar_add_new:
+        try:
+            # Calendar error emails use the same swaks/Gmail path even when
+            # --email-new is off, so SMTP credentials are required up front.
+            if not getattr(args, "_google_password", None):
+                args._google_password = verify_email_configuration(args)
+            calendar_match_cache, calendar_credentials, calendar_state = verify_calendar_configuration(args)
+            calendar_client = GoogleCalendarApiClient.from_credentials(
+                calendar_credentials,
+                timeout_seconds=float(args.timeout),
+            )
+        except RuntimeError as exc:
+            raise SystemExit(f"calendar configuration error: {exc}") from exc
+
     child_argv = _watch_child_arguments(original_argv)
     colors = not args.no_color and sys.stdout.isatty()
     effective_poll = args.poll_seconds
@@ -1898,6 +2722,22 @@ def watch_new_events(args: argparse.Namespace, original_argv: list[str]) -> int:
                             file=sys.stderr,
                             flush=True,
                         )
+                if args.calendar_add_new and calendar_client is not None and calendar_match_cache is not None:
+                    calendar_state = maybe_add_calendar_event_for_new_market(
+                        args=args,
+                        event=event,
+                        records=_watch_records_for_event(snapshot, ticker),
+                        detected_at=detected_at,
+                        local_tz=local_tz,
+                        match_cache=calendar_match_cache,
+                        calendar_client=calendar_client,
+                        state=calendar_state if calendar_state is not None else {
+                            "version": CALENDAR_STATE_FILE_VERSION,
+                            "entries": {},
+                        },
+                        email_password=args._google_password,
+                        colors=colors,
+                    )
         elif args.verbose:
             print(
                 f"[{format_local_time(detected_at, local_tz)}] no new parent markets "
@@ -2051,6 +2891,59 @@ def build_parser() -> argparse.ArgumentParser:
         default="ryan.grimm@gmail.com",
         help="swaks SMTP auth user used by --email-new",
     )
+    parser.add_argument(
+        "--calendar-add-new",
+        action="store_true",
+        help=(
+            "With --watch-new, create one Google Calendar event for each newly discovered "
+            "parent mention event whose overview/child text matches a phrase in "
+            "--calendar-matches. Requires OAuth client secret + token and SMTP for error mail."
+        ),
+    )
+    parser.add_argument(
+        "--calendar-auth",
+        action="store_true",
+        help=(
+            "One-shot interactive Google OAuth using --calendar-client-secret; "
+            "write --calendar-token and exit. Never used by headless --watch-new."
+        ),
+    )
+    parser.add_argument(
+        "--calendar-matches",
+        type=Path,
+        default=DEFAULT_CALENDAR_MATCHES_FILE,
+        help="JSON phrase list gating --calendar-add-new (version 1 phrases array)",
+    )
+    parser.add_argument(
+        "--calendar-client-secret",
+        type=Path,
+        default=DEFAULT_CALENDAR_CLIENT_SECRET_FILE,
+        help="Google OAuth desktop client secret JSON for calendar access",
+    )
+    parser.add_argument(
+        "--calendar-token",
+        type=Path,
+        default=DEFAULT_CALENDAR_TOKEN_FILE,
+        help="Stored Google OAuth user token written by --calendar-auth",
+    )
+    parser.add_argument(
+        "--calendar-id",
+        default=DEFAULT_CALENDAR_ID,
+        help="Target Google Calendar id for --calendar-add-new",
+    )
+    parser.add_argument(
+        "--calendar-state",
+        type=Path,
+        default=DEFAULT_CALENDAR_STATE_FILE,
+        help="Local JSON dedupe state for successful calendar inserts / schedule errors",
+    )
+    parser.add_argument(
+        "--calendar-duration-minutes",
+        type=int,
+        default=DEFAULT_CALENDAR_DURATION_MINUTES,
+        metavar="MINUTES",
+        help="Timed calendar event length when a precise start datetime is known",
+    )
     parser.add_argument("--verbose", action="store_true", help="Show pagination, cache, and retry diagnostics on stderr")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
@@ -2062,9 +2955,32 @@ def main() -> int:
     # Fail fast on invalid --type before any network/cache work (including watch).
     selected_types = parse_type_filter(getattr(args, "mention_types", None))
     args.selected_mention_types = selected_types
+    if args.calendar_auth:
+        conflict = [
+            flag
+            for flag, enabled in (
+                ("--watch-new", args.watch_new),
+                ("--email-new", args.email_new),
+                ("--queue-initialized", args.queue_initialized),
+                ("--test-email", args.test_email),
+                ("--calendar-add-new", args.calendar_add_new),
+            )
+            if enabled
+        ]
+        if conflict:
+            raise SystemExit(
+                "--calendar-auth is a one-shot auth command and cannot be combined with "
+                + ", ".join(conflict)
+            )
+        if int(args.calendar_duration_minutes) <= 0:
+            raise SystemExit("--calendar-duration-minutes must be greater than zero")
+        return run_calendar_auth(args)
     if args.test_email:
-        if args.watch_new or args.email_new or args.queue_initialized:
-            raise SystemExit("--test-email sends once and cannot be combined with --watch-new, --email-new, or --queue-initialized")
+        if args.watch_new or args.email_new or args.queue_initialized or args.calendar_add_new:
+            raise SystemExit(
+                "--test-email sends once and cannot be combined with --watch-new, "
+                "--email-new, --queue-initialized, or --calendar-add-new"
+            )
         try:
             return send_test_email(args)
         except RuntimeError as exc:
@@ -2073,6 +2989,10 @@ def main() -> int:
         raise SystemExit("--email-new is only valid together with --watch-new")
     if args.queue_initialized and not args.watch_new:
         raise SystemExit("--queue-initialized is only valid together with --watch-new")
+    if args.calendar_add_new and not args.watch_new:
+        raise SystemExit("--calendar-add-new is only valid together with --watch-new")
+    if args.calendar_add_new and int(args.calendar_duration_minutes) <= 0:
+        raise SystemExit("--calendar-duration-minutes must be greater than zero")
     if args.watch_new:
         return watch_new_events(args, original_argv)
     if args.days <= 0:

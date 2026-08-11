@@ -48,6 +48,9 @@ Requirements: **Python 3** (stdlib only). No `pip install` for basic discovery.
 
 # Watch + email on each new parent event (needs swaks + Gmail app password)
 ./mention_scout.py --watch-new --email-new
+
+# Watch + auto-add phrase-matched new parents to Google Calendar (MS-0010)
+./mention_scout.py --watch-new --calendar-add-new
 ```
 
 ## Mention types
@@ -89,6 +92,77 @@ chmod 600 ~/.config/.google-password
 
 The password file is sourced, never printed or cached by the scout.
 
+## Google Calendar auto-add (optional)
+
+When watching for new parent events, mention-scout can create **one Google Calendar event** for markets that match phrases in an owner-edited file.
+
+### 1. Match phrases file
+
+Copy the example and edit anytime (no code change; phrase edits reload on mtime without restart):
+
+```bash
+mkdir -p ~/.config/mention-scout
+cp deploy/config/calendar-matches.example.json ~/.config/mention-scout/calendar-matches.json
+chmod 600 ~/.config/mention-scout/calendar-matches.json   # optional but recommended
+```
+
+Schema (v1):
+
+```json
+{
+  "version": 1,
+  "phrases": [
+    "abc world news tonight"
+  ]
+}
+```
+
+Matching is **case-insensitive substring** (OR across phrases) against parent overview fields plus child titles/tickers from the watch snapshot. Settlement rules text is **not** used for matching.
+
+### 2. Google OAuth (desktop client)
+
+1. In Google Cloud Console, create/enable a project with the **Google Calendar API**.
+2. Create an **OAuth client ID** of type **Desktop app** and download the JSON.
+3. Save it as `~/.config/mention-scout/client_secret.json` and `chmod 600` it.
+4. Install optional libraries (core scout stays stdlib-only without calendar):
+
+```bash
+python3 -m pip install --user google-auth google-auth-oauthlib google-api-python-client
+```
+
+5. Run one-shot browser consent (not inside systemd):
+
+```bash
+./mention_scout.py --calendar-auth
+```
+
+This writes `~/.config/mention-scout/token.json` (mode `600`). Headless `--watch-new --calendar-add-new` **never** opens a browser; missing/invalid secret, token, or match file fails fast at watch start.
+
+### 3. Run watch with calendar
+
+```bash
+./mention_scout.py --watch-new --calendar-add-new
+# optional: also email every new parent overview
+./mention_scout.py --watch-new --email-new --calendar-add-new
+```
+
+Behavior summary:
+
+| Topic | Default |
+|-------|---------|
+| Match file | `~/.config/mention-scout/calendar-matches.json` |
+| OAuth secret | `~/.config/mention-scout/client_secret.json` |
+| Token | `~/.config/mention-scout/token.json` |
+| Dedupe state | `~/.config/mention-scout/calendar-added.json` |
+| Calendar id | `primary` |
+| Timed duration | 60 minutes |
+| Date-only schedule | all-day event on that local date |
+| Missing schedule | no calendar row; one error email per ticker |
+| Calendar error email | sent even if `--email-new` is off (SMTP still required) |
+| Eligibility gate | phrases file only (no `--calendar-types`) |
+
+`--email-new` remains independent of calendar success/failure. Never commit `client_secret.json`, `token.json`, or live owner config files.
+
 ## Defaults worth knowing
 
 | Flag | Default |
@@ -99,6 +173,7 @@ The password file is sourced, never printed or cached by the scout.
 | `--env` | `prod` |
 | `--timezone` | `America/New_York` |
 | `--type` | all types |
+| `--calendar-add-new` | off |
 | cache | compact mention cache, 300s TTL |
 
 ```bash
@@ -113,6 +188,7 @@ The password file is sourced, never printed or cached by the scout.
 | `./mention_scout.py` | Stable entry (symlink) |
 | `kalshi_mention_scout.py` | Implementation (v16) |
 | `deploy/systemd/` | User unit template (placeholders) |
+| `deploy/config/calendar-matches.example.json` | Example calendar phrase list (copy to `~/.config/mention-scout/`) |
 | `scripts/install-user-service.sh` | Install/update/disable user watch unit |
 | `tests/` | Offline unit tests |
 | `scripts/factory-test.sh` | Compile + CLI smoke (+ pytest) |
@@ -204,8 +280,9 @@ Installer: `scripts/install-user-service.sh`
 ## Safety
 
 - **No trading** — market data + optional notifications only.
-- Do not commit `.env`, password files, OAuth tokens, or private cache JSON.
+- Do not commit `.env`, password files, OAuth client secrets, OAuth tokens, or private cache JSON.
 - Local caches (gitignored): `.kalshi_mention_scout_*cache*.json`
+- Calendar secrets stay under `~/.config/mention-scout/` (outside the repo).
 
 ## License / access
 
