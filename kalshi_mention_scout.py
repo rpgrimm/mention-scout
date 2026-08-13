@@ -48,6 +48,8 @@ Changes in v16:
     events when a new parent event matches owner phrases in
     ~/.config/mention-scout/calendar-matches.json. Includes --calendar-auth,
     local dedupe state, and calendar error emails via the existing swaks path.
+  * MS-0011: calendar-matches.json may set default_time and per-phrase time /
+    duration_minutes so date-only Kalshi schedules become timed local events.
 
 Changes in v15:
   * Adds Gmail credential loading from ``~/.config/.google-password`` for
@@ -1646,14 +1648,14 @@ class CalendarClient(Protocol):
 
 
 class CalendarMatchCache:
-    """Load and cache owner match phrases, reloading when the file mtime changes."""
+    """Load and cache owner match config, reloading when the file mtime changes."""
 
     def __init__(self, path: Path) -> None:
         self.path = path.expanduser()
         self._mtime_ns: int | None = None
-        self._phrases: tuple[str, ...] = ()
+        self._config: CalendarMatchConfig | None = None
 
-    def get_phrases(self) -> list[str]:
+    def get_config(self) -> "CalendarMatchConfig":
         try:
             stat = self.path.stat()
         except FileNotFoundError as exc:
@@ -1665,13 +1667,16 @@ class CalendarMatchCache:
         except OSError as exc:
             raise RuntimeError(f"cannot read calendar match file {self.path}: {exc}") from exc
 
-        if self._mtime_ns is not None and stat.st_mtime_ns == self._mtime_ns:
-            return list(self._phrases)
+        if self._mtime_ns is not None and stat.st_mtime_ns == self._mtime_ns and self._config is not None:
+            return self._config
 
-        phrases = load_calendar_match_phrases(self.path)
-        self._phrases = tuple(phrases)
+        config = load_calendar_match_config(self.path)
+        self._config = config
         self._mtime_ns = stat.st_mtime_ns
-        return list(self._phrases)
+        return config
+
+    def get_phrases(self) -> list[str]:
+        return [phrase.match for phrase in self.get_config().phrases]
 
 
 def _require_google_calendar_libs() -> tuple[Any, Any, Any, Any]:
@@ -1690,15 +1695,105 @@ def _require_google_calendar_libs() -> tuple[Any, Any, Any, Any]:
     return Credentials, InstalledAppFlow, build, GoogleAuthRequest
 
 
-def load_calendar_match_phrases(path: Path) -> list[str]:
+@dataclass(frozen=True)
+class CalendarLocalTime:
+    """Owner wall-clock time in the scout --timezone."""
+
+    hour: int
+    minute: int
+
+    def label(self) -> str:
+        return f"{self.hour:02d}:{self.minute:02d}"
+
+
+@dataclass(frozen=True)
+class CalendarPhrase:
+    """One match entry from calendar-matches.json (string or object form)."""
+
+    match: str
+    time: CalendarLocalTime | None = None
+    duration_minutes: int | None = None
+
+
+@dataclass(frozen=True)
+class CalendarMatchConfig:
+    """Validated owner calendar match file (MS-0010/MS-0011)."""
+
+    phrases: tuple[CalendarPhrase, ...]
+    default_time: CalendarLocalTime | None = None
+
+    def phrase_matches(self) -> list[str]:
+        return [phrase.match for phrase in self.phrases]
+
+    def phrase_by_match_casefold(self) -> dict[str, CalendarPhrase]:
+        return {phrase.match.casefold(): phrase for phrase in self.phrases}
+
+
+_CALENDAR_TIME_RE = re.compile(r"^(?P<hour>\d{1,2}):(?P<minute>\d{2})$")
+
+
+def parse_calendar_local_time(value: object, *, field_name: str, path: Path, index: int | None = None) -> CalendarLocalTime:
+    """Parse HH:MM / H:MM (24h) for calendar match config fields."""
+    where = f"{field_name}" if index is None else f"{field_name} at phrases[{index}]"
+    if not isinstance(value, str):
+        raise RuntimeError(
+            f"calendar match file {where} must be a string HH:MM in {path}"
+        )
+    raw = value.strip()
+    match = _CALENDAR_TIME_RE.fullmatch(raw)
+    if match is None:
+        raise RuntimeError(
+            f"calendar match file {where} must be 24-hour HH:MM or H:MM "
+            f"(got {value!r}) in {path}"
+        )
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute"))
+    if hour > 23 or minute > 59:
+        raise RuntimeError(
+            f"calendar match file {where} is out of range (got {raw!r}; "
+            f"hour 0-23, minute 0-59) in {path}"
+        )
+    return CalendarLocalTime(hour=hour, minute=minute)
+
+
+def parse_calendar_duration_minutes(value: object, *, path: Path, index: int) -> int:
+    """Parse a whole positive minute duration from a phrase object."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(
+            f"calendar match phrase at index {index} duration_minutes must be "
+            f"a positive whole number of minutes in {path}"
+        )
+    if isinstance(value, float) and not value.is_integer():
+        raise RuntimeError(
+            f"calendar match phrase at index {index} duration_minutes must be "
+            f"a whole number of minutes (got {value!r}) in {path}"
+        )
+    minutes = int(value)
+    if minutes <= 0:
+        raise RuntimeError(
+            f"calendar match phrase at index {index} duration_minutes must be "
+            f"greater than zero (got {minutes}) in {path}"
+        )
+    return minutes
+
+
+def load_calendar_match_config(path: Path) -> CalendarMatchConfig:
     """Load and validate the owner calendar match JSON file.
 
-    Schema (v1)::
+    Schema (v1, MS-0011)::
 
-        {"version": 1, "phrases": ["abc world news tonight", ...]}
+        {
+          "version": 1,
+          "default_time": "18:30",
+          "phrases": [
+            "simple string",
+            {"match": "abc world news tonight", "time": "18:30", "duration_minutes": 30}
+          ]
+        }
 
-    Phrases are trimmed, case-preserved for display, de-duplicated casefold,
-    and must be non-empty after trim.
+    Plain strings remain valid. Object entries require non-empty ``match`` and
+    may set optional ``time`` / ``duration_minutes``. Phrases are de-duplicated
+    by casefolded match text (first wins).
     """
     match_path = path.expanduser()
     try:
@@ -1736,29 +1831,114 @@ def load_calendar_match_phrases(path: Path) -> list[str]:
     if not isinstance(phrases_raw, list):
         raise RuntimeError(f"calendar match file 'phrases' must be a JSON array: {match_path}")
 
-    cleaned: list[str] = []
+    default_time = None
+    if "default_time" in payload and payload.get("default_time") is not None:
+        default_time = parse_calendar_local_time(
+            payload.get("default_time"),
+            field_name="default_time",
+            path=match_path,
+        )
+
+    cleaned: list[CalendarPhrase] = []
     seen: set[str] = set()
     for index, item in enumerate(phrases_raw):
-        if not isinstance(item, str):
+        phrase_time: CalendarLocalTime | None = None
+        duration_minutes: int | None = None
+        if isinstance(item, str):
+            phrase_text = item.strip()
+            if not phrase_text:
+                raise RuntimeError(
+                    f"calendar match phrase at index {index} is empty after trim in {match_path}"
+                )
+        elif isinstance(item, dict):
+            if "match" not in item:
+                raise RuntimeError(
+                    f"calendar match phrase at index {index} object is missing "
+                    f"'match' string in {match_path}"
+                )
+            match_value = item.get("match")
+            if not isinstance(match_value, str):
+                raise RuntimeError(
+                    f"calendar match phrase at index {index} 'match' must be a string in {match_path}"
+                )
+            phrase_text = match_value.strip()
+            if not phrase_text:
+                raise RuntimeError(
+                    f"calendar match phrase at index {index} 'match' is empty after trim in {match_path}"
+                )
+            if "time" in item and item.get("time") is not None:
+                phrase_time = parse_calendar_local_time(
+                    item.get("time"),
+                    field_name="time",
+                    path=match_path,
+                    index=index,
+                )
+            if "duration_minutes" in item and item.get("duration_minutes") is not None:
+                duration_minutes = parse_calendar_duration_minutes(
+                    item.get("duration_minutes"),
+                    path=match_path,
+                    index=index,
+                )
+        else:
             raise RuntimeError(
-                f"calendar match phrase at index {index} must be a string in {match_path}"
+                f"calendar match phrase at index {index} must be a string or object in {match_path}"
             )
-        phrase = item.strip()
-        if not phrase:
-            raise RuntimeError(
-                f"calendar match phrase at index {index} is empty after trim in {match_path}"
-            )
-        key = phrase.casefold()
+
+        key = phrase_text.casefold()
         if key in seen:
             continue
         seen.add(key)
-        cleaned.append(phrase)
+        cleaned.append(
+            CalendarPhrase(
+                match=phrase_text,
+                time=phrase_time,
+                duration_minutes=duration_minutes,
+            )
+        )
 
     if not cleaned:
         raise RuntimeError(
             f"calendar match file has no usable phrases after trim/dedupe: {match_path}"
         )
-    return cleaned
+    return CalendarMatchConfig(phrases=tuple(cleaned), default_time=default_time)
+
+
+def load_calendar_match_phrases(path: Path) -> list[str]:
+    """Load match strings only (compatibility wrapper around full config load)."""
+    return load_calendar_match_config(path).phrase_matches()
+
+
+def resolve_calendar_match_options(
+    matched_phrases: list[str],
+    config: CalendarMatchConfig,
+) -> tuple[CalendarLocalTime | None, int | None, str | None]:
+    """Pick owner time/duration from matched phrases (first hit wins per field).
+
+    Returns ``(owner_time_or_none, duration_override_or_none, time_source_label)``.
+    Time source label is the phrase match text, ``default_time``, or None.
+    """
+    by_key = config.phrase_by_match_casefold()
+    owner_time: CalendarLocalTime | None = None
+    time_source: str | None = None
+    duration_override: int | None = None
+
+    for matched in matched_phrases:
+        phrase = by_key.get(str(matched).casefold())
+        if phrase is None:
+            continue
+        if owner_time is None and phrase.time is not None:
+            owner_time = phrase.time
+            time_source = phrase.match
+        if duration_override is None and phrase.duration_minutes is not None:
+            duration_override = phrase.duration_minutes
+        if owner_time is not None and duration_override is not None:
+            break
+
+    if owner_time is None and config.default_time is not None:
+        owner_time = config.default_time
+        time_source = "default_time"
+
+    return owner_time, duration_override, time_source
 
 
 def event_calendar_haystack(
@@ -1950,8 +2130,14 @@ def build_calendar_event_body(
     detected_at: datetime,
     records: list[dict[str, Any]] | None = None,
     schedule: tuple[datetime | None, str, bool] | None = None,
+    owner_time: CalendarLocalTime | None = None,
+    owner_time_source: str | None = None,
 ) -> dict[str, Any]:
     """Build a Google Calendar events.insert body for one parent mention event.
+
+    Date-only Kalshi schedules become all-day unless ``owner_time`` is set
+    (MS-0011), in which case the event is timed on that local date. Real timed
+    Kalshi schedules are never overridden by owner_time.
 
     Raises RuntimeError when no usable schedule exists (caller should email).
     """
@@ -1977,6 +2163,23 @@ def build_calendar_event_body(
     else:
         summary = f"[Kalshi] {title}"
 
+    local_start = start_utc.astimezone(local_tz)
+    applied_owner_time = False
+    if date_only and owner_time is not None:
+        day = local_start.date()
+        local_start = datetime(
+            day.year,
+            day.month,
+            day.day,
+            owner_time.hour,
+            owner_time.minute,
+            tzinfo=local_tz,
+        )
+        source_note = owner_time_source or "calendar-matches"
+        source = f"{source}; owner time {owner_time.label()} from {source_note}"
+        date_only = False
+        applied_owner_time = True
+
     event_ticker = clean_display_text(event.get("event_ticker")) or "(no event ticker)"
     description_bits = [
         f"Event ticker: {event_ticker}",
@@ -1999,6 +2202,11 @@ def build_calendar_event_body(
             "Created by mention-scout --watch-new --calendar-add-new.",
         ]
     )
+    if applied_owner_time and owner_time is not None:
+        description_bits.append(
+            f"Owner-configured local start time: {owner_time.label()} "
+            f"({getattr(local_tz, 'key', str(local_tz))})."
+        )
 
     body: dict[str, Any] = {
         "summary": summary,
@@ -2007,7 +2215,6 @@ def build_calendar_event_body(
     if url:
         body["source"] = {"title": "Kalshi", "url": url}
 
-    local_start = start_utc.astimezone(local_tz)
     if date_only:
         day = local_start.date()
         body["start"] = {"date": day.isoformat()}
@@ -2354,10 +2561,11 @@ def maybe_add_calendar_event_for_new_market(
         return state
 
     try:
-        phrases = match_cache.get_phrases()
+        match_config = match_cache.get_config()
     except RuntimeError as exc:
         return _fail("match-file", exc)
 
+    phrases = match_config.phrase_matches()
     haystack = event_calendar_haystack(event, records)
     matched = matching_calendar_phrases(haystack, phrases)
     if not matched:
@@ -2365,14 +2573,25 @@ def maybe_add_calendar_event_for_new_market(
             print(f"calendar skip (no phrase match): {ticker}", file=sys.stderr, flush=True)
         return state
 
+    owner_time, duration_override, owner_time_source = resolve_calendar_match_options(
+        matched, match_config
+    )
+    effective_duration = (
+        int(duration_override)
+        if duration_override is not None
+        else int(args.calendar_duration_minutes)
+    )
+
     try:
         body = build_calendar_event_body(
             event,
             matched_phrases=matched,
             local_tz=local_tz,
-            duration_minutes=int(args.calendar_duration_minutes),
+            duration_minutes=effective_duration,
             detected_at=detected_at,
             records=records,
+            owner_time=owner_time,
+            owner_time_source=owner_time_source,
         )
     except RuntimeError as exc:
         # Missing schedule: email once per ticker via error-kind dedupe entry.
@@ -2912,7 +3131,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--calendar-matches",
         type=Path,
         default=DEFAULT_CALENDAR_MATCHES_FILE,
-        help="JSON phrase list gating --calendar-add-new (version 1 phrases array)",
+        help="JSON phrase list gating --calendar-add-new (version 1; strings or {match,time,duration_minutes}; optional default_time)",
     )
     parser.add_argument(
         "--calendar-client-secret",

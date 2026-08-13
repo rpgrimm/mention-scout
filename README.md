@@ -106,18 +106,28 @@ cp deploy/config/calendar-matches.example.json ~/.config/mention-scout/calendar-
 chmod 600 ~/.config/mention-scout/calendar-matches.json   # optional but recommended
 ```
 
-Schema (v1):
+Schema (v1, MS-0011): plain strings still work; objects may set a local clock time for **date-only** Kalshi schedules.
 
 ```json
 {
   "version": 1,
+  "default_time": "18:30",
   "phrases": [
-    "abc world news tonight"
+    "simple substring still works",
+    {
+      "match": "abc world news tonight",
+      "time": "18:30",
+      "duration_minutes": 30
+    }
   ]
 }
 ```
 
-Matching is **case-insensitive substring** (OR across phrases) against parent overview fields plus child titles/tickers from the watch snapshot. Settlement rules text is **not** used for matching.
+- Matching is **case-insensitive substring** (OR across phrases) against parent overview fields plus child titles/tickers from the watch snapshot. Settlement rules text is **not** used for matching.
+- `time` / `default_time` use 24-hour `HH:MM` or `H:MM` in `--timezone` (default `America/New_York`).
+- Owner time applies only when Kalshi gives a **date without a reliable clock time**. Real timed Kalshi datetimes are not overridden.
+- If a date-only market matches and no `time` / `default_time` applies, the calendar row stays **all-day** (MS-0010 behavior).
+- Optional phrase `duration_minutes` overrides `--calendar-duration-minutes` for that insert.
 
 ### 2. Google OAuth (desktop client)
 
@@ -155,8 +165,8 @@ Behavior summary:
 | Token | `~/.config/mention-scout/token.json` |
 | Dedupe state | `~/.config/mention-scout/calendar-added.json` |
 | Calendar id | `primary` |
-| Timed duration | 60 minutes |
-| Date-only schedule | all-day event on that local date |
+| Timed duration | 60 minutes (phrase `duration_minutes` may override) |
+| Date-only schedule | all-day, unless match JSON sets `time` / `default_time` → timed local start |
 | Missing schedule | no calendar row; one error email per ticker |
 | Calendar error email | sent even if `--email-new` is off (SMTP still required) |
 | Eligibility gate | phrases file only (no `--calendar-types`) |

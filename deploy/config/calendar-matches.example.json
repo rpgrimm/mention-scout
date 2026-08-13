@@ -1,6 +1,11 @@
 {
   "version": 1,
+  "default_time": "18:30",
   "phrases": [
-    "abc world news tonight"
+    {
+      "match": "abc world news tonight",
+      "time": "18:30",
+      "duration_minutes": 30
+    }
   ]
 }
