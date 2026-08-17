@@ -142,9 +142,15 @@ This writes `~/.config/mention-scout/token.json` (mode `600`). Headless `--watch
 
 ```bash
 ./mention_scout.py --watch-new --calendar-add-new
-# optional: also email every new parent overview
+# optional: also email every new parent overview (owner SMTP only)
 ./mention_scout.py --watch-new --email-new --calendar-add-new
+# optional: add Google Calendar attendees on each newly created event
+./mention_scout.py --watch-new --calendar-add-new \
+  --invite-email partner@gmail.com \
+  --invite-email other@example.com
 ```
+
+`--invite-email` is **repeatable**. Guests are attached as Calendar **attendees** and Google is asked to notify them (`sendUpdates=all`). Mention-scout does **not** SMTP-mail invitees (no swaks fan-out). Requires `--calendar-add-new`. Ops caution: each matched new market can notify external guests via Google.
 
 Behavior summary:
 
@@ -160,6 +166,7 @@ Behavior summary:
 | Missing schedule | no calendar row; one error email per ticker |
 | Calendar error email | sent even if `--email-new` is off (SMTP still required) |
 | Eligibility gate | phrases file only (no `--calendar-types`) |
+| `--invite-email` | off; when set, attendees on new calendar rows only |
 
 `--email-new` remains independent of calendar success/failure. Never commit `client_secret.json`, `token.json`, or live owner config files.
 

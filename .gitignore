@@ -16,3 +16,4 @@ token.json
 **/token.json
 .calendar-added.json
 # END OPENCLAW SOFTWARE FACTORY
+.venv
