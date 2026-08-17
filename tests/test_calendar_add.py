@@ -1,4 +1,4 @@
-"""Offline unit tests for MS-0010 Google Calendar auto-add helpers."""
+"""Offline unit tests for MS-0010/MS-0011 Google Calendar auto-add helpers."""
 
 from __future__ import annotations
 
@@ -532,6 +532,207 @@ def test_match_cache_reloads_on_mtime_change(tmp_path: Path) -> None:
 
 def test_example_match_file_in_repo() -> None:
     example = ROOT / "deploy" / "config" / "calendar-matches.example.json"
-    payload = json.loads(example.read_text(encoding="utf-8"))
-    assert payload["version"] == 1
-    assert "abc world news tonight" in payload["phrases"]
+    config = scout.load_calendar_match_config(example)
+    assert config.default_time is not None
+    assert config.default_time.label() == "18:30"
+    assert [p.match for p in config.phrases] == ["abc world news tonight"]
+    wnt = config.phrases[0]
+    assert wnt.time is not None and wnt.time.label() == "18:30"
+    assert wnt.duration_minutes == 30
+    assert scout.load_calendar_match_phrases(example) == ["abc world news tonight"]
+
+
+def _write_match_config(path: Path, payload: dict) -> Path:
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def test_load_calendar_match_config_object_time_and_default(tmp_path: Path) -> None:
+    path = _write_match_config(
+        tmp_path / "m.json",
+        {
+            "version": 1,
+            "default_time": "19:00",
+            "phrases": [
+                "plain show",
+                {
+                    "match": "abc world news tonight",
+                    "time": "18:30",
+                    "duration_minutes": 30,
+                },
+            ],
+        },
+    )
+    config = scout.load_calendar_match_config(path)
+    assert config.default_time is not None
+    assert config.default_time.label() == "19:00"
+    assert [p.match for p in config.phrases] == ["plain show", "abc world news tonight"]
+    wnt = config.phrases[1]
+    assert wnt.time is not None and wnt.time.label() == "18:30"
+    assert wnt.duration_minutes == 30
+    # compatibility wrapper
+    assert scout.load_calendar_match_phrases(path) == ["plain show", "abc world news tonight"]
+
+
+def test_load_calendar_match_config_rejects_bad_time(tmp_path: Path) -> None:
+    path = _write_match_config(
+        tmp_path / "m.json",
+        {"version": 1, "phrases": [{"match": "x", "time": "25:00"}]},
+    )
+    with pytest.raises(RuntimeError, match="out of range|HH:MM"):
+        scout.load_calendar_match_config(path)
+
+
+def test_load_calendar_match_config_rejects_ampm_time(tmp_path: Path) -> None:
+    path = _write_match_config(
+        tmp_path / "m.json",
+        {"version": 1, "default_time": "6:30pm", "phrases": ["x"]},
+    )
+    with pytest.raises(RuntimeError, match="HH:MM"):
+        scout.load_calendar_match_config(path)
+
+
+def test_load_calendar_match_config_rejects_bad_duration(tmp_path: Path) -> None:
+    path = _write_match_config(
+        tmp_path / "m.json",
+        {"version": 1, "phrases": [{"match": "x", "duration_minutes": 0}]},
+    )
+    with pytest.raises(RuntimeError, match="greater than zero"):
+        scout.load_calendar_match_config(path)
+
+
+def test_build_calendar_event_body_date_only_with_owner_time() -> None:
+    event = {
+        "event_ticker": "KXWNT-26AUG12",
+        "title": "ABC World News Tonight",
+        "mention_type_label": "World News Tonight",
+        "series_ticker": "KXWNT",
+        "first_event_time_utc": "2026-08-12T04:00:00Z",
+        "event_time_sources": ["ticker date (exact time unavailable)"],
+    }
+    body = scout.build_calendar_event_body(
+        event,
+        matched_phrases=["abc world news tonight"],
+        local_tz=NY,
+        duration_minutes=30,
+        detected_at=datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc),
+        owner_time=scout.CalendarLocalTime(18, 30),
+        owner_time_source="abc world news tonight",
+    )
+    assert "dateTime" in body["start"]
+    assert body["start"]["timeZone"] == "America/New_York"
+    start = datetime.fromisoformat(body["start"]["dateTime"])
+    end = datetime.fromisoformat(body["end"]["dateTime"])
+    assert start.tzinfo is not None
+    assert start.astimezone(NY).hour == 18 and start.astimezone(NY).minute == 30
+    assert start.astimezone(NY).date().isoformat() == "2026-08-12"
+    assert (end - start).total_seconds() == 30 * 60
+    assert "owner time 18:30" in body["description"]
+
+
+def test_build_calendar_event_body_timed_ignores_owner_time() -> None:
+    event = {
+        "event_ticker": "KXWNT-26AUG11",
+        "title": "ABC World News Tonight",
+        "mention_type_label": "World News Tonight",
+        "series_ticker": "KXWNT",
+        "first_event_time_utc": "2026-08-11T23:30:00Z",
+        "event_time_sources": ["Kalshi event occurrence_datetime"],
+    }
+    body = scout.build_calendar_event_body(
+        event,
+        matched_phrases=["abc world news tonight"],
+        local_tz=NY,
+        duration_minutes=60,
+        detected_at=datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc),
+        owner_time=scout.CalendarLocalTime(18, 30),
+        owner_time_source="abc world news tonight",
+    )
+    start = datetime.fromisoformat(body["start"]["dateTime"])
+    # 23:30Z is 19:30 America/New_York in August (EDT)
+    assert start.astimezone(NY).hour == 19
+    assert start.astimezone(NY).minute == 30
+
+
+def test_resolve_calendar_match_options_prefers_phrase_then_default() -> None:
+    config = scout.CalendarMatchConfig(
+        phrases=(
+            scout.CalendarPhrase(match="plain"),
+            scout.CalendarPhrase(
+                match="abc world news tonight",
+                time=scout.CalendarLocalTime(18, 30),
+                duration_minutes=45,
+            ),
+        ),
+        default_time=scout.CalendarLocalTime(17, 0),
+    )
+    time, duration, source = scout.resolve_calendar_match_options(
+        ["plain", "abc world news tonight"], config
+    )
+    assert time is not None and time.label() == "18:30"
+    assert duration == 45
+    assert source == "abc world news tonight"
+
+    time2, duration2, source2 = scout.resolve_calendar_match_options(["plain"], config)
+    assert time2 is not None and time2.label() == "17:00"
+    assert duration2 is None
+    assert source2 == "default_time"
+
+
+def test_maybe_add_date_only_uses_match_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    matches = _write_match_config(
+        tmp_path / "matches.json",
+        {
+            "version": 1,
+            "phrases": [
+                {
+                    "match": "abc world news tonight",
+                    "time": "18:30",
+                    "duration_minutes": 30,
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(scout, "run_swaks_email", lambda **kwargs: (_ for _ in ()).throw(AssertionError("no email")))
+    args = SimpleNamespace(
+        calendar_matches=matches,
+        calendar_state=tmp_path / "state.json",
+        calendar_id="primary",
+        calendar_duration_minutes=60,
+        calendar_client_secret=tmp_path / "secret.json",
+        calendar_token=tmp_path / "token.json",
+        email_to="to@example.com",
+        email_from="from@example.com",
+        smtp_server="smtp.example.com:587",
+        smtp_auth_user="user",
+        verbose=False,
+    )
+    client = FakeCalendarClient()
+    event = {
+        "event_ticker": "KXWNT-26AUG12",
+        "title": "ABC World News Tonight mentions",
+        "mention_type_label": "World News Tonight",
+        "series_ticker": "KXWNT",
+        "first_event_time_utc": "2026-08-12T04:00:00Z",
+        "event_time_sources": ["ticker date (exact time unavailable)"],
+    }
+    scout.maybe_add_calendar_event_for_new_market(
+        args=args,
+        event=event,
+        records=[],
+        detected_at=datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc),
+        local_tz=NY,
+        match_cache=scout.CalendarMatchCache(matches),
+        calendar_client=client,
+        state={"version": 1, "entries": {}},
+        email_password="x",
+        colors=False,
+    )
+    assert len(client.calls) == 1
+    body = client.calls[0][1]
+    assert "dateTime" in body["start"]
+    start = datetime.fromisoformat(body["start"]["dateTime"])
+    assert start.astimezone(NY).strftime("%Y-%m-%d %H:%M") == "2026-08-12 18:30"
+    end = datetime.fromisoformat(body["end"]["dateTime"])
+    assert (end - start).total_seconds() == 30 * 60
+
