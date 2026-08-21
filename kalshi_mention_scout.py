@@ -40,6 +40,12 @@ Changes in v10:
   * Bumps the cache format so a v9 compact cache is rebuilt once with the
     corrected query-status marker.
 
+Changes in v16.1 / MS-0013:
+  * Adds repeatable --invite-email for --calendar-add-new. Each newly created
+    Google Calendar event can include those addresses as attendees with
+    sendUpdates=all so Google notifies guests. Scout SMTP is unchanged (no
+    fan-out to invitees).
+
 Changes in v16:
   * Adds a clickable Kalshi event-page URL to new-market notification emails.
     The URL uses any explicit Kalshi URL field when present; otherwise it is
@@ -106,7 +112,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-VERSION = "16.0.0"
+VERSION = "16.1.0"
 CACHE_FORMAT_VERSION = 5
 DEFAULT_MENTION_CACHE_FILE = ".kalshi_mention_scout_mentions_cache.json"
 DEFAULT_FULL_CACHE_FILE = ".kalshi_mention_scout_full_cache.json"
@@ -125,6 +131,7 @@ CALENDAR_MATCH_FILE_VERSION = 1
 CALENDAR_STATE_FILE_VERSION = 1
 CALENDAR_OAUTH_SCOPES = ("https://www.googleapis.com/auth/calendar.events",)
 CALENDAR_ERROR_BODY_LIMIT = 1200
+MAX_INVITE_EMAILS = 20
 
 BASE_URLS = {
     "prod": "https://api.elections.kalshi.com/trade-api/v2",
@@ -1398,6 +1405,7 @@ def _watch_child_arguments(original_argv: list[str]) -> list[str]:
         "--calendar-id",
         "--calendar-state",
         "--calendar-duration-minutes",
+        "--invite-email",
     }
     strip_prefixes = tuple(f"{name}=" for name in strip_value_flags)
     for token in original_argv:
@@ -1643,7 +1651,13 @@ def run_swaks_email(
 class CalendarClient(Protocol):
     """Minimal calendar insert surface used by watch mode and unit tests."""
 
-    def insert_event(self, calendar_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    def insert_event(
+        self,
+        calendar_id: str,
+        body: dict[str, Any],
+        *,
+        send_updates: str | None = None,
+    ) -> dict[str, Any]:
         """Create one calendar event and return the API-like response dict."""
 
 
@@ -2121,6 +2135,50 @@ def resolve_calendar_schedule(
     return parsed, source, date_only
 
 
+
+def validate_email_address(addr: str, *, flag: str = "--invite-email") -> str:
+    """Return a stripped email address or raise RuntimeError with an actionable message."""
+    value = str(addr or "").strip()
+    if not value:
+        raise RuntimeError(f"invalid {flag}: address is empty")
+    if any(ch.isspace() for ch in value):
+        raise RuntimeError(f"invalid {flag}: address must not contain whitespace: {value!r}")
+    for bad in ("\r", "\n", ",", ";", "<", ">", '"', "\\"):
+        if bad in value:
+            raise RuntimeError(f"invalid {flag}: address contains forbidden character: {value!r}")
+    if value.count("@") != 1:
+        raise RuntimeError(f"invalid {flag}: expected one @ in address: {value!r}")
+    local, domain = value.split("@", 1)
+    if not local or not domain:
+        raise RuntimeError(f"invalid {flag}: missing local or domain part: {value!r}")
+    if "." not in domain:
+        raise RuntimeError(f"invalid {flag}: domain must contain a dot: {value!r}")
+    if domain.startswith(".") or domain.endswith(".") or ".." in domain:
+        raise RuntimeError(f"invalid {flag}: malformed domain: {value!r}")
+    return value
+
+
+def normalize_invite_emails(raw: list[str] | None, *, flag: str = "--invite-email") -> list[str]:
+    """Validate, dedupe (casefold), and preserve order for --invite-email values."""
+    if not raw:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        addr = validate_email_address(item, flag=flag)
+        key = addr.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(addr)
+    if len(out) > MAX_INVITE_EMAILS:
+        raise RuntimeError(
+            f"{flag} accepts at most {MAX_INVITE_EMAILS} addresses "
+            f"(got {len(out)} after dedupe)"
+        )
+    return out
+
+
 def build_calendar_event_body(
     event: dict[str, Any],
     *,
@@ -2132,6 +2190,7 @@ def build_calendar_event_body(
     schedule: tuple[datetime | None, str, bool] | None = None,
     owner_time: CalendarLocalTime | None = None,
     owner_time_source: str | None = None,
+    invite_emails: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a Google Calendar events.insert body for one parent mention event.
 
@@ -2214,6 +2273,9 @@ def build_calendar_event_body(
     }
     if url:
         body["source"] = {"title": "Kalshi", "url": url}
+    attendees = [{"email": addr} for addr in (invite_emails or []) if str(addr).strip()]
+    if attendees:
+        body["attendees"] = attendees
 
     if date_only:
         day = local_start.date()
@@ -2404,9 +2466,18 @@ class GoogleCalendarApiClient:
         service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
         return cls(service, timeout_seconds=timeout_seconds)
 
-    def insert_event(self, calendar_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    def insert_event(
+        self,
+        calendar_id: str,
+        body: dict[str, Any],
+        *,
+        send_updates: str | None = None,
+    ) -> dict[str, Any]:
         try:
-            request = self._service.events().insert(calendarId=calendar_id, body=body)
+            kwargs: dict[str, Any] = {"calendarId": calendar_id, "body": body}
+            if send_updates:
+                kwargs["sendUpdates"] = send_updates
+            request = self._service.events().insert(**kwargs)
             # google-api-python-client supports num_retries on execute.
             result = request.execute(num_retries=2)
         except Exception as exc:  # noqa: BLE001 - normalize all API failures
@@ -2581,7 +2652,7 @@ def maybe_add_calendar_event_for_new_market(
         if duration_override is not None
         else int(args.calendar_duration_minutes)
     )
-
+    invite_emails = list(getattr(args, "invite_emails", None) or [])
     try:
         body = build_calendar_event_body(
             event,
@@ -2592,13 +2663,18 @@ def maybe_add_calendar_event_for_new_market(
             records=records,
             owner_time=owner_time,
             owner_time_source=owner_time_source,
+            invite_emails=invite_emails,
         )
     except RuntimeError as exc:
         # Missing schedule: email once per ticker via error-kind dedupe entry.
         return _fail("schedule", exc, matched=matched, dedupe_error=True)
 
     try:
-        result = calendar_client.insert_event(calendar_id, body)
+        result = calendar_client.insert_event(
+            calendar_id,
+            body,
+            send_updates=("all" if invite_emails else None),
+        )
     except RuntimeError as exc:
         return _fail("insert", exc, matched=matched)
 
@@ -2621,8 +2697,16 @@ def maybe_add_calendar_event_for_new_market(
             flush=True,
         )
     else:
+        if invite_emails:
+            guest_note = f"; attendees: {', '.join(invite_emails)}"
+        else:
+            guest_note = ""
         print(
-            color(f"calendar event added for {ticker} (matched {matched[0]!r})", "green", colors),
+            color(
+                f"calendar event added for {ticker} (matched {matched[0]!r}{guest_note})",
+                "green",
+                colors,
+            ),
             flush=True,
         )
     return state
@@ -3163,6 +3247,18 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="MINUTES",
         help="Timed calendar event length when a precise start datetime is known",
     )
+    parser.add_argument(
+        "--invite-email",
+        action="append",
+        default=None,
+        metavar="ADDRESS",
+        dest="invite_email",
+        help=(
+            "With --calendar-add-new, add ADDRESS as a Google Calendar attendee on each "
+            "newly created event (repeatable). Google is asked to notify guests "
+            "(sendUpdates=all). Does not send scout SMTP mail to invitees."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true", help="Show pagination, cache, and retry diagnostics on stderr")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
@@ -3174,6 +3270,15 @@ def main() -> int:
     # Fail fast on invalid --type before any network/cache work (including watch).
     selected_types = parse_type_filter(getattr(args, "mention_types", None))
     args.selected_mention_types = selected_types
+    try:
+        args.invite_emails = normalize_invite_emails(getattr(args, "invite_email", None))
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    if args.invite_emails and not args.calendar_add_new:
+        raise SystemExit(
+            "--invite-email requires --calendar-add-new "
+            "(calendar attendees only; scout does not SMTP-mail invitees)"
+        )
     if args.calendar_auth:
         conflict = [
             flag

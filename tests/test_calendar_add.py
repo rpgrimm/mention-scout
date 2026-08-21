@@ -25,10 +25,18 @@ class FakeCalendarClient:
         self.calls: list[tuple[str, dict]] = []
         self.fail_with: Exception | None = None
 
-    def insert_event(self, calendar_id: str, body: dict) -> dict:
+    def insert_event(
+        self,
+        calendar_id: str,
+        body: dict,
+        *,
+        send_updates: str | None = None,
+    ) -> dict:
         if self.fail_with is not None:
             raise self.fail_with
+        # Keep legacy 2-tuple shape for existing MS-0010 assertions.
         self.calls.append((calendar_id, body))
+        self.last_send_updates = send_updates
         return {
             "id": f"evt-{len(self.calls)}",
             "htmlLink": f"https://calendar.google.com/event?eid={len(self.calls)}",
@@ -245,6 +253,7 @@ def test_maybe_add_inserts_on_match(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         smtp_server="smtp.example.com:587",
         smtp_auth_user="user",
         verbose=False,
+        invite_emails=[],
     )
     client = FakeCalendarClient()
     event = {
@@ -306,6 +315,7 @@ def test_maybe_add_skips_non_matching(tmp_path: Path, monkeypatch: pytest.Monkey
         smtp_server="smtp.example.com:587",
         smtp_auth_user="user",
         verbose=False,
+        invite_emails=[],
     )
     client = FakeCalendarClient()
     event = {
@@ -350,6 +360,7 @@ def test_maybe_add_missing_schedule_emails_once(tmp_path: Path, monkeypatch: pyt
         smtp_server="smtp.example.com:587",
         smtp_auth_user="user",
         verbose=False,
+        invite_emails=[],
     )
     client = FakeCalendarClient()
     event = {
@@ -411,6 +422,7 @@ def test_maybe_add_insert_failure_emails(tmp_path: Path, monkeypatch: pytest.Mon
         smtp_server="smtp.example.com:587",
         smtp_auth_user="user",
         verbose=False,
+        invite_emails=[],
     )
     client = FakeCalendarClient()
     client.fail_with = RuntimeError("API 403 insufficient permissions")
