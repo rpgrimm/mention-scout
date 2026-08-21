@@ -678,14 +678,15 @@ def test_resolve_calendar_match_options_prefers_phrase_then_default() -> None:
         ),
         default_time=scout.CalendarLocalTime(17, 0),
     )
-    time, duration, source = scout.resolve_calendar_match_options(
+    time, duration, source, where = scout.resolve_calendar_match_options(
         ["plain", "abc world news tonight"], config
     )
     assert time is not None and time.label() == "18:30"
     assert duration == 45
     assert source == "abc world news tonight"
+    assert where is None
 
-    time2, duration2, source2 = scout.resolve_calendar_match_options(["plain"], config)
+    time2, duration2, source2, where2 = scout.resolve_calendar_match_options(["plain"], config)
     assert time2 is not None and time2.label() == "17:00"
     assert duration2 is None
     assert source2 == "default_time"
@@ -748,3 +749,92 @@ def test_maybe_add_date_only_uses_match_time(tmp_path: Path, monkeypatch: pytest
     end = datetime.fromisoformat(body["end"]["dateTime"])
     assert (end - start).total_seconds() == 30 * 60
 
+
+
+def test_resolve_calendar_match_options_where_to_watch_first_hit() -> None:
+    config = scout.CalendarMatchConfig(
+        phrases=(
+            scout.CalendarPhrase(match="plain"),
+            scout.CalendarPhrase(
+                match="abc world news tonight",
+                time=scout.CalendarLocalTime(18, 30),
+                duration_minutes=30,
+                where_to_watch="5-1 nbc",
+            ),
+            scout.CalendarPhrase(
+                match="world news",
+                where_to_watch="4-1 cbs",
+            ),
+        )
+    )
+    _t, _d, _s, where = scout.resolve_calendar_match_options(
+        ["abc world news tonight", "world news"],
+        config,
+    )
+    assert where == "5-1 nbc"
+    _t2, _d2, _s2, where2 = scout.resolve_calendar_match_options(["world news"], config)
+    assert where2 == "4-1 cbs"
+
+
+def test_build_calendar_event_body_includes_where_to_watch() -> None:
+    event = {
+        "event_ticker": "KXWNT-26AUG11",
+        "title": "Will ABC World News Tonight mention tariffs?",
+        "mention_type_label": "World News Tonight",
+        "series_ticker": "KXWNT",
+        "first_event_time_utc": "2026-08-11T04:00:00Z",
+        "event_time_sources": ["ticker date (exact time unavailable)"],
+    }
+    body = scout.build_calendar_event_body(
+        event,
+        matched_phrases=["abc world news tonight"],
+        local_tz=NY,
+        duration_minutes=30,
+        detected_at=datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc),
+        owner_time=scout.CalendarLocalTime(18, 30),
+        owner_time_source="abc world news tonight",
+        where_to_watch="5-1 nbc",
+    )
+    assert "Where to watch: 5-1 nbc" in body["description"]
+
+
+def test_load_calendar_match_config_where_to_watch(tmp_path: Path) -> None:
+    path = tmp_path / "m.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "phrases": [
+                    {
+                        "match": "abc world news tonight",
+                        "time": "18:30",
+                        "duration_minutes": 30,
+                        "where_to_watch": "5-1 nbc",
+                    }
+                ],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = scout.load_calendar_match_config(path)
+    assert config.phrases[0].where_to_watch == "5-1 nbc"
+    payload = scout.calendar_phrase_to_payload(config.phrases[0])
+    assert payload["where_to_watch"] == "5-1 nbc"
+
+
+def test_load_calendar_match_config_rejects_empty_where(tmp_path: Path) -> None:
+    path = tmp_path / "m.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "phrases": [{"match": "abc", "where_to_watch": "   "}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="where_to_watch"):
+        scout.load_calendar_match_config(path)

@@ -5,7 +5,8 @@
     {
       "match": "abc world news tonight",
       "time": "18:30",
-      "duration_minutes": 30
+      "duration_minutes": 30,
+      "where_to_watch": "5-1 nbc"
     }
   ]
 }

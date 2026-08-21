@@ -46,4 +46,6 @@ Status: `status:needs-triage` `status:ready` `status:blocked` `status:wontfix`
 | MS-0004 | #4 | Email dry-run / injectable send seam | `type:feature` `P2` `status:needs-triage` |
 | MS-0005 | #5 | Versioned implementation filename layout | `type:chore` `P3` `status:needs-triage` |
 | MS-0006 | #7 | Mention type labels, filter, email subject prefix | `type:feature` `P1` `status:blocked` |
+| MS-0012 | #19 | FAIL email on startup / preflight failure | `type:feature` `P1` `status:ready` |
 | MS-0013 | #20 | Calendar attendees via --invite-email | `type:feature` `P2` `status:ready` |
+| MS-0014 | #23 | Audit calendar-matches + safe --add-calendar-match | `type:feature` `P2` `status:ready` |

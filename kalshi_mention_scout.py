@@ -40,6 +40,22 @@ Changes in v10:
   * Bumps the cache format so a v9 compact cache is rebuilt once with the
     corrected query-status marker.
 
+Changes in v16.3 / MS-0015:
+  * calendar-matches phrase objects may set optional where_to_watch (free text,
+    e.g. "5-1 nbc"). --add-calendar-match accepts --where-to-watch and updates
+    existing case-insensitive matches the same way as --time/--duration-minutes.
+  * New Google Calendar inserts include a "Where to watch: …" description line
+    when a matched phrase supplies where_to_watch (first hit wins).
+
+Changes in v16.2 / MS-0014:
+  * Adds --audit-calendar-matches one-shot to validate calendar-matches.json
+    with the same loader rules as watch/calendar preflight. On failure, exits
+    non-zero and (by default) emails a FAIL report with subject
+    ``[Kalshi] FAIL | calendar-matches audit``; opt out with --no-email-on-fail.
+  * Adds --add-calendar-match --match … with optional --time / --duration-minutes
+    / --dry-run for safe atomic create/update of phrases (plain string or object
+    form), preserving existing entries and default_time.
+
 Changes in v16.1 / MS-0013:
   * Adds repeatable --invite-email for --calendar-add-new. Each newly created
     Google Calendar event can include those addresses as attendees with
@@ -99,6 +115,7 @@ import argparse
 import json
 import os
 import re
+import socket
 import sys
 import time
 import subprocess
@@ -112,7 +129,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-VERSION = "16.1.0"
+VERSION = "16.3.0"
 CACHE_FORMAT_VERSION = 5
 DEFAULT_MENTION_CACHE_FILE = ".kalshi_mention_scout_mentions_cache.json"
 DEFAULT_FULL_CACHE_FILE = ".kalshi_mention_scout_full_cache.json"
@@ -1390,6 +1407,11 @@ def _watch_child_arguments(original_argv: list[str]) -> list[str]:
         "--test-email",
         "--calendar-add-new",
         "--calendar-auth",
+        "--audit-calendar-matches",
+        "--add-calendar-match",
+        "--dry-run",
+        "--email-on-fail",
+        "--no-email-on-fail",
     }
     strip_value_flags = {
         "--poll-seconds",
@@ -1406,6 +1428,10 @@ def _watch_child_arguments(original_argv: list[str]) -> list[str]:
         "--calendar-state",
         "--calendar-duration-minutes",
         "--invite-email",
+        "--match",
+        "--time",
+        "--duration-minutes",
+        "--where-to-watch",
     }
     strip_prefixes = tuple(f"{name}=" for name in strip_value_flags)
     for token in original_argv:
@@ -1727,6 +1753,7 @@ class CalendarPhrase:
     match: str
     time: CalendarLocalTime | None = None
     duration_minutes: int | None = None
+    where_to_watch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1791,6 +1818,27 @@ def parse_calendar_duration_minutes(value: object, *, path: Path, index: int) ->
     return minutes
 
 
+def parse_calendar_where_to_watch(
+    value: object,
+    *,
+    path: Path,
+    index: int | None = None,
+    field_name: str = "where_to_watch",
+) -> str:
+    """Parse a non-empty where-to-watch string (channel / call letters, free text)."""
+    where = field_name if index is None else f"{field_name} at phrases[{index}]"
+    if not isinstance(value, str):
+        raise RuntimeError(
+            f"calendar match file {where} must be a string in {path}"
+        )
+    text = value.strip()
+    if not text:
+        raise RuntimeError(
+            f"calendar match file {where} is empty after trim in {path}"
+        )
+    return text
+
+
 def load_calendar_match_config(path: Path) -> CalendarMatchConfig:
     """Load and validate the owner calendar match JSON file.
 
@@ -1801,13 +1849,18 @@ def load_calendar_match_config(path: Path) -> CalendarMatchConfig:
           "default_time": "18:30",
           "phrases": [
             "simple string",
-            {"match": "abc world news tonight", "time": "18:30", "duration_minutes": 30}
+            {
+              "match": "abc world news tonight",
+              "time": "18:30",
+              "duration_minutes": 30,
+              "where_to_watch": "5-1 nbc"
+            }
           ]
         }
 
     Plain strings remain valid. Object entries require non-empty ``match`` and
-    may set optional ``time`` / ``duration_minutes``. Phrases are de-duplicated
-    by casefolded match text (first wins).
+    may set optional ``time`` / ``duration_minutes`` / ``where_to_watch``.
+    Phrases are de-duplicated by casefolded match text (first wins).
     """
     match_path = path.expanduser()
     try:
@@ -1858,6 +1911,7 @@ def load_calendar_match_config(path: Path) -> CalendarMatchConfig:
     for index, item in enumerate(phrases_raw):
         phrase_time: CalendarLocalTime | None = None
         duration_minutes: int | None = None
+        where_to_watch: str | None = None
         if isinstance(item, str):
             phrase_text = item.strip()
             if not phrase_text:
@@ -1893,6 +1947,12 @@ def load_calendar_match_config(path: Path) -> CalendarMatchConfig:
                     path=match_path,
                     index=index,
                 )
+            if "where_to_watch" in item and item.get("where_to_watch") is not None:
+                where_to_watch = parse_calendar_where_to_watch(
+                    item.get("where_to_watch"),
+                    path=match_path,
+                    index=index,
+                )
         else:
             raise RuntimeError(
                 f"calendar match phrase at index {index} must be a string or object in {match_path}"
@@ -1907,6 +1967,7 @@ def load_calendar_match_config(path: Path) -> CalendarMatchConfig:
                 match=phrase_text,
                 time=phrase_time,
                 duration_minutes=duration_minutes,
+                where_to_watch=where_to_watch,
             )
         )
 
@@ -1922,19 +1983,393 @@ def load_calendar_match_phrases(path: Path) -> list[str]:
     return load_calendar_match_config(path).phrase_matches()
 
 
+def calendar_phrase_to_payload(phrase: CalendarPhrase) -> str | dict[str, Any]:
+    """Serialize one phrase as plain string or object (only set optional fields)."""
+    if (
+        phrase.time is None
+        and phrase.duration_minutes is None
+        and phrase.where_to_watch is None
+    ):
+        return phrase.match
+    payload: dict[str, Any] = {"match": phrase.match}
+    if phrase.time is not None:
+        payload["time"] = phrase.time.label()
+    if phrase.duration_minutes is not None:
+        payload["duration_minutes"] = int(phrase.duration_minutes)
+    if phrase.where_to_watch is not None:
+        payload["where_to_watch"] = phrase.where_to_watch
+    return payload
+
+
+def calendar_match_config_to_payload(config: CalendarMatchConfig) -> dict[str, Any]:
+    """Canonical JSON-serializable dict for version 1 calendar-matches files.
+
+    Known keys only (version, optional default_time, phrases). Unknown top-level
+    keys from a prior hand-edit are dropped on rewrite — documented MS-0014 behavior.
+    """
+    payload: dict[str, Any] = {
+        "version": CALENDAR_MATCH_FILE_VERSION,
+    }
+    if config.default_time is not None:
+        payload["default_time"] = config.default_time.label()
+    payload["phrases"] = [calendar_phrase_to_payload(phrase) for phrase in config.phrases]
+    return payload
+
+
+def save_calendar_match_config(path: Path, config: CalendarMatchConfig) -> None:
+    """Atomically write a validated calendar match config (mode 600)."""
+    write_cache_atomic(path.expanduser(), calendar_match_config_to_payload(config))
+
+
+def format_calendar_phrase_entry(phrase: CalendarPhrase) -> str:
+    """Compact JSON-ish entry string for stdout summaries."""
+    return json.dumps(calendar_phrase_to_payload(phrase), ensure_ascii=False)
+
+
+def add_calendar_match(
+    path: Path,
+    *,
+    match: str,
+    time: str | None = None,
+    duration_minutes: int | None = None,
+    where_to_watch: str | None = None,
+    create_if_missing: bool = True,
+    dry_run: bool = False,
+) -> tuple[CalendarMatchConfig, str, CalendarPhrase]:
+    """Load-or-create, merge one phrase, validate, and optionally save.
+
+    Returns ``(new_config, action, resulting_phrase)`` where action is one of
+    ``created-file``, ``added``, ``updated``, or ``already-present``.
+
+    Passing any of ``time``, ``duration_minutes``, or ``where_to_watch`` on an
+    existing case-insensitive match updates that entry (unspecified fields kept).
+    """
+    match_path = path.expanduser()
+    phrase_text = str(match).strip()
+    if not phrase_text:
+        raise RuntimeError("--match must be a non-empty phrase after trim")
+
+    phrase_time: CalendarLocalTime | None = None
+    if time is not None:
+        phrase_time = parse_calendar_local_time(
+            time,
+            field_name="--time",
+            path=match_path,
+        )
+
+    phrase_duration: int | None = None
+    if duration_minutes is not None:
+        # Reuse file-loader rules (whole minutes > 0) with a CLI-oriented label.
+        try:
+            phrase_duration = parse_calendar_duration_minutes(
+                duration_minutes,
+                path=match_path,
+                index=0,
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            message = message.replace(
+                "calendar match phrase at index 0 duration_minutes",
+                "--duration-minutes",
+            )
+            message = message.replace(f" in {match_path}", "")
+            raise RuntimeError(message) from exc
+
+    phrase_where: str | None = None
+    if where_to_watch is not None:
+        try:
+            phrase_where = parse_calendar_where_to_watch(
+                where_to_watch,
+                path=match_path,
+                field_name="--where-to-watch",
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            message = message.replace(f" in {match_path}", "")
+            message = message.replace("calendar match file ", "")
+            raise RuntimeError(message) from exc
+
+    wants_update_fields = (
+        phrase_time is not None
+        or phrase_duration is not None
+        or phrase_where is not None
+    )
+    file_existed = match_path.exists()
+
+    if file_existed:
+        try:
+            config = load_calendar_match_config(match_path)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"refusing to modify invalid calendar match file {match_path}: {exc}. "
+                "Fix the file or run: ./mention_scout.py --audit-calendar-matches"
+            ) from exc
+        phrases = list(config.phrases)
+        default_time = config.default_time
+        action_created = False
+    else:
+        if not create_if_missing:
+            raise RuntimeError(f"calendar match file is missing: {match_path}")
+        phrases = []
+        default_time = None
+        action_created = True
+
+    key = phrase_text.casefold()
+    existing_index: int | None = None
+    for index, existing in enumerate(phrases):
+        if existing.match.casefold() == key:
+            existing_index = index
+            break
+
+    if existing_index is None:
+        new_phrase = CalendarPhrase(
+            match=phrase_text,
+            time=phrase_time,
+            duration_minutes=phrase_duration,
+            where_to_watch=phrase_where,
+        )
+        phrases.append(new_phrase)
+        action = "created-file" if action_created else "added"
+    else:
+        existing = phrases[existing_index]
+        if not wants_update_fields:
+            new_phrase = existing
+            action = "already-present"
+        else:
+            new_phrase = CalendarPhrase(
+                match=existing.match,
+                time=phrase_time if phrase_time is not None else existing.time,
+                duration_minutes=(
+                    phrase_duration
+                    if phrase_duration is not None
+                    else existing.duration_minutes
+                ),
+                where_to_watch=(
+                    phrase_where
+                    if phrase_where is not None
+                    else existing.where_to_watch
+                ),
+            )
+            phrases[existing_index] = new_phrase
+            action = "updated"
+
+    new_config = CalendarMatchConfig(phrases=tuple(phrases), default_time=default_time)
+    # Ensure the in-memory result is always a complete valid config.
+    if not new_config.phrases:
+        raise RuntimeError(
+            f"calendar match file would have no usable phrases after change: {match_path}"
+        )
+
+    if not dry_run and action != "already-present":
+        # Parent dir for first create; write_cache_atomic also mkdirs, but keep
+        # config dir private when we are the ones creating it.
+        if action_created:
+            match_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(match_path.parent, 0o700)
+            except OSError:
+                pass
+        save_calendar_match_config(match_path, new_config)
+    elif not dry_run and action == "already-present" and action_created:
+        # Should not happen (empty create without phrase), but keep safe.
+        save_calendar_match_config(match_path, new_config)
+
+    return new_config, action, new_phrase
+
+
+def format_calendar_matches_audit_fail_email(
+    *,
+    path: Path,
+    error: str,
+    detected_at: datetime,
+    local_tz: ZoneInfo,
+) -> tuple[str, str]:
+    """Build subject/body for calendar-matches audit failure (no secrets)."""
+    subject = "[Kalshi] FAIL | calendar-matches audit"
+    err_text = " ".join(str(error).split())
+    if len(err_text) > CALENDAR_ERROR_BODY_LIMIT:
+        err_text = err_text[: CALENDAR_ERROR_BODY_LIMIT - 3] + "..."
+    abs_path = path.expanduser()
+    try:
+        abs_path_display = str(abs_path.resolve())
+    except OSError:
+        abs_path_display = str(abs_path)
+
+    try:
+        host = socket.gethostname() or "unknown"
+    except OSError:
+        host = "unknown"
+
+    body = "\n".join(
+        [
+            "Kalshi mention-scout calendar-matches AUDIT FAILURE",
+            "",
+            f"Time: {format_local_time(detected_at, local_tz)}",
+            f"Host: {host}",
+            f"Version: {VERSION}",
+            f"Path: {abs_path_display}",
+            "",
+            "Error:",
+            f"  {err_text}",
+            "",
+            "Schema reminder (version 1):",
+            "  {",
+            '    "version": 1,',
+            '    "default_time": "18:30",',
+            '    "phrases": [',
+            '      "simple string",',
+            '      {"match": "phrase", "time": "18:30", "duration_minutes": 30, '
+            '"where_to_watch": "5-1 nbc"}',
+            "    ]",
+            "  }",
+            "",
+            "Remediation ideas:",
+            "  - Fix JSON syntax (commas, quotes, brackets)",
+            "  - Validate times as 24-hour HH:MM / H:MM",
+            '  - Or re-add via: ./mention_scout.py --add-calendar-match --match "…"',
+            "  - Example: deploy/config/calendar-matches.example.json",
+            "  - After fix: ./mention_scout.py --audit-calendar-matches",
+            "",
+            "This alert is from --audit-calendar-matches (MS-0014).",
+            "Watch startup FAIL mail (MS-0012), when enabled, is separate.",
+        ]
+    )
+    return subject, body
+
+
+def run_audit_calendar_matches(args: argparse.Namespace) -> int:
+    """One-shot validate calendar-matches.json; optional FAIL email on error."""
+    match_path = args.calendar_matches.expanduser()
+    try:
+        local_tz = ZoneInfo(args.timezone)
+    except Exception as exc:
+        raise SystemExit(f"Invalid --timezone {args.timezone!r}: {exc}") from exc
+
+    try:
+        config = load_calendar_match_config(match_path)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr, flush=True)
+        if getattr(args, "email_on_fail", True):
+            try:
+                password = verify_email_configuration(args)
+            except RuntimeError as mail_exc:
+                print(
+                    f"audit FAIL email skipped: {mail_exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                try:
+                    subject, body = format_calendar_matches_audit_fail_email(
+                        path=match_path,
+                        error=str(exc),
+                        detected_at=datetime.now(timezone.utc),
+                        local_tz=local_tz,
+                    )
+                    run_swaks_email(
+                        recipient=args.email_to,
+                        sender=args.email_from,
+                        smtp_server=args.smtp_server,
+                        auth_user=args.smtp_auth_user,
+                        password=password,
+                        subject=subject,
+                        body=body,
+                    )
+                    if args.verbose:
+                        print(
+                            f"audit FAIL email sent to {args.email_to}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                except RuntimeError as mail_exc:
+                    print(
+                        f"audit FAIL email failed: {mail_exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        return 1
+
+    try:
+        path_display = str(match_path.resolve())
+    except OSError:
+        path_display = str(match_path)
+
+    lines = [
+        "calendar-matches audit ok",
+        f"path: {path_display}",
+        f"version: {CALENDAR_MATCH_FILE_VERSION}",
+        f"phrases: {len(config.phrases)}",
+    ]
+    if config.default_time is not None:
+        lines.append(f"default_time: {config.default_time.label()}")
+    else:
+        lines.append("default_time: (none)")
+    print("\n".join(lines), flush=True)
+
+    if args.verbose:
+        for phrase in config.phrases:
+            print(f"  - {format_calendar_phrase_entry(phrase)}", flush=True)
+    return 0
+
+
+def run_add_calendar_match(args: argparse.Namespace) -> int:
+    """One-shot add/update a calendar match phrase with atomic write."""
+    match_path = args.calendar_matches.expanduser()
+    raw_match = getattr(args, "match", None)
+    if raw_match is None:
+        raise SystemExit("--add-calendar-match requires --match")
+
+    time_value = getattr(args, "match_time", None)
+    duration_value = getattr(args, "match_duration_minutes", None)
+    where_value = getattr(args, "where_to_watch", None)
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    try:
+        config, action, phrase = add_calendar_match(
+            match_path,
+            match=str(raw_match),
+            time=time_value,
+            duration_minutes=duration_value,
+            where_to_watch=where_value,
+            create_if_missing=True,
+            dry_run=dry_run,
+        )
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    try:
+        path_display = str(match_path.resolve())
+    except OSError:
+        path_display = str(match_path)
+
+    lines = [
+        "calendar-matches dry-run" if dry_run else "calendar-matches updated",
+        f"path: {path_display}",
+        f"action: {action}",
+        f"entry: {format_calendar_phrase_entry(phrase)}",
+        f"phrases_total: {len(config.phrases)}",
+    ]
+    if dry_run:
+        lines.append("dry-run: not written")
+    print("\n".join(lines), flush=True)
+    return 0
+
+
 def resolve_calendar_match_options(
     matched_phrases: list[str],
     config: CalendarMatchConfig,
-) -> tuple[CalendarLocalTime | None, int | None, str | None]:
-    """Pick owner time/duration from matched phrases (first hit wins per field).
+) -> tuple[CalendarLocalTime | None, int | None, str | None, str | None]:
+    """Pick owner time/duration/where-to-watch from matched phrases (first hit wins).
 
-    Returns ``(owner_time_or_none, duration_override_or_none, time_source_label)``.
+    Returns
+    ``(owner_time_or_none, duration_override_or_none, time_source_label, where_to_watch)``.
     Time source label is the phrase match text, ``default_time``, or None.
     """
     by_key = config.phrase_by_match_casefold()
     owner_time: CalendarLocalTime | None = None
     time_source: str | None = None
     duration_override: int | None = None
+    where_to_watch: str | None = None
 
     for matched in matched_phrases:
         phrase = by_key.get(str(matched).casefold())
@@ -1945,14 +2380,20 @@ def resolve_calendar_match_options(
             time_source = phrase.match
         if duration_override is None and phrase.duration_minutes is not None:
             duration_override = phrase.duration_minutes
-        if owner_time is not None and duration_override is not None:
+        if where_to_watch is None and phrase.where_to_watch is not None:
+            where_to_watch = phrase.where_to_watch
+        if (
+            owner_time is not None
+            and duration_override is not None
+            and where_to_watch is not None
+        ):
             break
 
     if owner_time is None and config.default_time is not None:
         owner_time = config.default_time
         time_source = "default_time"
 
-    return owner_time, duration_override, time_source
+    return owner_time, duration_override, time_source, where_to_watch
 
 
 def event_calendar_haystack(
@@ -2190,6 +2631,7 @@ def build_calendar_event_body(
     schedule: tuple[datetime | None, str, bool] | None = None,
     owner_time: CalendarLocalTime | None = None,
     owner_time_source: str | None = None,
+    where_to_watch: str | None = None,
     invite_emails: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a Google Calendar events.insert body for one parent mention event.
@@ -2244,6 +2686,9 @@ def build_calendar_event_body(
         f"Event ticker: {event_ticker}",
         f"Matched phrase(s): {', '.join(matched_phrases) if matched_phrases else '(none)'}",
     ]
+    where_text = str(where_to_watch).strip() if where_to_watch is not None else ""
+    if where_text:
+        description_bits.append(f"Where to watch: {where_text}")
     if type_label:
         description_bits.append(f"Mention type: {type_label}")
     url = kalshi_event_url(event)
@@ -2644,8 +3089,8 @@ def maybe_add_calendar_event_for_new_market(
             print(f"calendar skip (no phrase match): {ticker}", file=sys.stderr, flush=True)
         return state
 
-    owner_time, duration_override, owner_time_source = resolve_calendar_match_options(
-        matched, match_config
+    owner_time, duration_override, owner_time_source, where_to_watch = (
+        resolve_calendar_match_options(matched, match_config)
     )
     effective_duration = (
         int(duration_override)
@@ -2663,6 +3108,7 @@ def maybe_add_calendar_event_for_new_market(
             records=records,
             owner_time=owner_time,
             owner_time_source=owner_time_source,
+            where_to_watch=where_to_watch,
             invite_emails=invite_emails,
         )
     except RuntimeError as exc:
@@ -3259,6 +3705,84 @@ def build_parser() -> argparse.ArgumentParser:
             "(sendUpdates=all). Does not send scout SMTP mail to invitees."
         ),
     )
+    parser.add_argument(
+        "--audit-calendar-matches",
+        action="store_true",
+        help=(
+            "One-shot: validate --calendar-matches with the same rules as watch/calendar "
+            "preflight. On success print a short OK summary (no email). On failure exit "
+            "non-zero and, by default, email a FAIL report when SMTP is loadable."
+        ),
+    )
+    parser.add_argument(
+        "--add-calendar-match",
+        action="store_true",
+        help=(
+            "One-shot: safely create/update one phrase in --calendar-matches (requires "
+            "--match). Optional --time/--duration-minutes/--where-to-watch update fields; "
+            "writes are atomic; invalid existing files are refused (not clobbered)."
+        ),
+    )
+    parser.add_argument(
+        "--match",
+        default=None,
+        metavar="TEXT",
+        help="Phrase text for --add-calendar-match (case-insensitive identity for updates)",
+    )
+    parser.add_argument(
+        "--time",
+        default=None,
+        metavar="HH:MM",
+        dest="match_time",
+        help=(
+            "Optional 24-hour local time (HH:MM / H:MM) for --add-calendar-match; "
+            "writes object form when set"
+        ),
+    )
+    parser.add_argument(
+        "--duration-minutes",
+        type=int,
+        default=None,
+        metavar="N",
+        dest="match_duration_minutes",
+        help=(
+            "Optional positive whole-minute duration override for --add-calendar-match; "
+            "writes object form when set"
+        ),
+    )
+    parser.add_argument(
+        "--where-to-watch",
+        default=None,
+        metavar="TEXT",
+        dest="where_to_watch",
+        help=(
+            "Optional free-text where-to-watch note for --add-calendar-match "
+            "(e.g. '5-1 nbc'); stored on the phrase and copied into new calendar "
+            "event descriptions; writes object form when set"
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --add-calendar-match: validate and print the plan without writing",
+    )
+    email_on_fail_group = parser.add_mutually_exclusive_group()
+    email_on_fail_group.add_argument(
+        "--email-on-fail",
+        dest="email_on_fail",
+        action="store_true",
+        default=None,
+        help=(
+            "With --audit-calendar-matches: attempt FAIL email on invalid match file "
+            "(default when audit runs)"
+        ),
+    )
+    email_on_fail_group.add_argument(
+        "--no-email-on-fail",
+        dest="email_on_fail",
+        action="store_false",
+        help="With --audit-calendar-matches: validate locally only (no SMTP attempt)",
+    )
     parser.add_argument("--verbose", action="store_true", help="Show pagination, cache, and retry diagnostics on stderr")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
@@ -3279,6 +3803,85 @@ def main() -> int:
             "--invite-email requires --calendar-add-new "
             "(calendar attendees only; scout does not SMTP-mail invitees)"
         )
+
+    # MS-0014: audit/add are one-shots; default email-on-fail ON for audit only.
+    if getattr(args, "email_on_fail", None) is None:
+        args.email_on_fail = True
+
+    audit_mode = bool(getattr(args, "audit_calendar_matches", False))
+    add_mode = bool(getattr(args, "add_calendar_match", False))
+    match_flag_set = getattr(args, "match", None) is not None
+    time_flag_set = getattr(args, "match_time", None) is not None
+    duration_flag_set = getattr(args, "match_duration_minutes", None) is not None
+    where_flag_set = getattr(args, "where_to_watch", None) is not None
+    dry_run_set = bool(getattr(args, "dry_run", False))
+    # Detect whether the operator explicitly passed email-on-fail toggles.
+    email_on_fail_explicit = any(
+        token == "--email-on-fail"
+        or token == "--no-email-on-fail"
+        or token.startswith("--email-on-fail=")
+        or token.startswith("--no-email-on-fail=")
+        for token in original_argv
+    )
+
+    if audit_mode and add_mode:
+        raise SystemExit(
+            "--audit-calendar-matches and --add-calendar-match cannot be combined"
+        )
+    if match_flag_set and not add_mode:
+        raise SystemExit("--match is only valid together with --add-calendar-match")
+    if time_flag_set and not add_mode:
+        raise SystemExit("--time is only valid together with --add-calendar-match")
+    if duration_flag_set and not add_mode:
+        raise SystemExit(
+            "--duration-minutes is only valid together with --add-calendar-match"
+        )
+    if where_flag_set and not add_mode:
+        raise SystemExit(
+            "--where-to-watch is only valid together with --add-calendar-match"
+        )
+    if dry_run_set and not add_mode:
+        raise SystemExit("--dry-run is only valid together with --add-calendar-match")
+    if email_on_fail_explicit and not audit_mode:
+        raise SystemExit(
+            "--email-on-fail/--no-email-on-fail are only valid together with "
+            "--audit-calendar-matches"
+        )
+    if add_mode and not match_flag_set:
+        raise SystemExit("--add-calendar-match requires --match")
+    if duration_flag_set and int(args.match_duration_minutes) <= 0:
+        raise SystemExit("--duration-minutes must be greater than zero")
+
+    oneshot_conflicts = [
+        flag
+        for flag, enabled in (
+            ("--watch-new", args.watch_new),
+            ("--email-new", args.email_new),
+            ("--queue-initialized", args.queue_initialized),
+            ("--test-email", args.test_email),
+            ("--calendar-add-new", args.calendar_add_new),
+            ("--calendar-auth", args.calendar_auth),
+            ("--invite-email", bool(args.invite_emails)),
+        )
+        if enabled
+    ]
+
+    if audit_mode:
+        if oneshot_conflicts:
+            raise SystemExit(
+                "--audit-calendar-matches is a one-shot command and cannot be combined with "
+                + ", ".join(oneshot_conflicts)
+            )
+        return run_audit_calendar_matches(args)
+
+    if add_mode:
+        if oneshot_conflicts:
+            raise SystemExit(
+                "--add-calendar-match is a one-shot command and cannot be combined with "
+                + ", ".join(oneshot_conflicts)
+            )
+        return run_add_calendar_match(args)
+
     if args.calendar_auth:
         conflict = [
             flag
