@@ -40,6 +40,13 @@ Changes in v10:
   * Bumps the cache format so a v9 compact cache is rebuilt once with the
     corrected query-status marker.
 
+Changes in v16.3 / MS-0015:
+  * calendar-matches phrase objects may set optional where_to_watch (free text,
+    e.g. "5-1 nbc"). --add-calendar-match accepts --where-to-watch and updates
+    existing case-insensitive matches the same way as --time/--duration-minutes.
+  * New Google Calendar inserts include a "Where to watch: …" description line
+    when a matched phrase supplies where_to_watch (first hit wins).
+
 Changes in v16.2 / MS-0014:
   * Adds --audit-calendar-matches one-shot to validate calendar-matches.json
     with the same loader rules as watch/calendar preflight. On failure, exits
@@ -122,7 +129,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-VERSION = "16.2.0"
+VERSION = "16.3.0"
 CACHE_FORMAT_VERSION = 5
 DEFAULT_MENTION_CACHE_FILE = ".kalshi_mention_scout_mentions_cache.json"
 DEFAULT_FULL_CACHE_FILE = ".kalshi_mention_scout_full_cache.json"
@@ -1424,6 +1431,7 @@ def _watch_child_arguments(original_argv: list[str]) -> list[str]:
         "--match",
         "--time",
         "--duration-minutes",
+        "--where-to-watch",
     }
     strip_prefixes = tuple(f"{name}=" for name in strip_value_flags)
     for token in original_argv:
@@ -1745,6 +1753,7 @@ class CalendarPhrase:
     match: str
     time: CalendarLocalTime | None = None
     duration_minutes: int | None = None
+    where_to_watch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1809,6 +1818,27 @@ def parse_calendar_duration_minutes(value: object, *, path: Path, index: int) ->
     return minutes
 
 
+def parse_calendar_where_to_watch(
+    value: object,
+    *,
+    path: Path,
+    index: int | None = None,
+    field_name: str = "where_to_watch",
+) -> str:
+    """Parse a non-empty where-to-watch string (channel / call letters, free text)."""
+    where = field_name if index is None else f"{field_name} at phrases[{index}]"
+    if not isinstance(value, str):
+        raise RuntimeError(
+            f"calendar match file {where} must be a string in {path}"
+        )
+    text = value.strip()
+    if not text:
+        raise RuntimeError(
+            f"calendar match file {where} is empty after trim in {path}"
+        )
+    return text
+
+
 def load_calendar_match_config(path: Path) -> CalendarMatchConfig:
     """Load and validate the owner calendar match JSON file.
 
@@ -1819,13 +1849,18 @@ def load_calendar_match_config(path: Path) -> CalendarMatchConfig:
           "default_time": "18:30",
           "phrases": [
             "simple string",
-            {"match": "abc world news tonight", "time": "18:30", "duration_minutes": 30}
+            {
+              "match": "abc world news tonight",
+              "time": "18:30",
+              "duration_minutes": 30,
+              "where_to_watch": "5-1 nbc"
+            }
           ]
         }
 
     Plain strings remain valid. Object entries require non-empty ``match`` and
-    may set optional ``time`` / ``duration_minutes``. Phrases are de-duplicated
-    by casefolded match text (first wins).
+    may set optional ``time`` / ``duration_minutes`` / ``where_to_watch``.
+    Phrases are de-duplicated by casefolded match text (first wins).
     """
     match_path = path.expanduser()
     try:
@@ -1876,6 +1911,7 @@ def load_calendar_match_config(path: Path) -> CalendarMatchConfig:
     for index, item in enumerate(phrases_raw):
         phrase_time: CalendarLocalTime | None = None
         duration_minutes: int | None = None
+        where_to_watch: str | None = None
         if isinstance(item, str):
             phrase_text = item.strip()
             if not phrase_text:
@@ -1911,6 +1947,12 @@ def load_calendar_match_config(path: Path) -> CalendarMatchConfig:
                     path=match_path,
                     index=index,
                 )
+            if "where_to_watch" in item and item.get("where_to_watch") is not None:
+                where_to_watch = parse_calendar_where_to_watch(
+                    item.get("where_to_watch"),
+                    path=match_path,
+                    index=index,
+                )
         else:
             raise RuntimeError(
                 f"calendar match phrase at index {index} must be a string or object in {match_path}"
@@ -1925,6 +1967,7 @@ def load_calendar_match_config(path: Path) -> CalendarMatchConfig:
                 match=phrase_text,
                 time=phrase_time,
                 duration_minutes=duration_minutes,
+                where_to_watch=where_to_watch,
             )
         )
 
@@ -1942,13 +1985,19 @@ def load_calendar_match_phrases(path: Path) -> list[str]:
 
 def calendar_phrase_to_payload(phrase: CalendarPhrase) -> str | dict[str, Any]:
     """Serialize one phrase as plain string or object (only set optional fields)."""
-    if phrase.time is None and phrase.duration_minutes is None:
+    if (
+        phrase.time is None
+        and phrase.duration_minutes is None
+        and phrase.where_to_watch is None
+    ):
         return phrase.match
     payload: dict[str, Any] = {"match": phrase.match}
     if phrase.time is not None:
         payload["time"] = phrase.time.label()
     if phrase.duration_minutes is not None:
         payload["duration_minutes"] = int(phrase.duration_minutes)
+    if phrase.where_to_watch is not None:
+        payload["where_to_watch"] = phrase.where_to_watch
     return payload
 
 
@@ -1983,6 +2032,7 @@ def add_calendar_match(
     match: str,
     time: str | None = None,
     duration_minutes: int | None = None,
+    where_to_watch: str | None = None,
     create_if_missing: bool = True,
     dry_run: bool = False,
 ) -> tuple[CalendarMatchConfig, str, CalendarPhrase]:
@@ -1990,6 +2040,9 @@ def add_calendar_match(
 
     Returns ``(new_config, action, resulting_phrase)`` where action is one of
     ``created-file``, ``added``, ``updated``, or ``already-present``.
+
+    Passing any of ``time``, ``duration_minutes``, or ``where_to_watch`` on an
+    existing case-insensitive match updates that entry (unspecified fields kept).
     """
     match_path = path.expanduser()
     phrase_text = str(match).strip()
@@ -2022,7 +2075,25 @@ def add_calendar_match(
             message = message.replace(f" in {match_path}", "")
             raise RuntimeError(message) from exc
 
-    wants_schedule = phrase_time is not None or phrase_duration is not None
+    phrase_where: str | None = None
+    if where_to_watch is not None:
+        try:
+            phrase_where = parse_calendar_where_to_watch(
+                where_to_watch,
+                path=match_path,
+                field_name="--where-to-watch",
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            message = message.replace(f" in {match_path}", "")
+            message = message.replace("calendar match file ", "")
+            raise RuntimeError(message) from exc
+
+    wants_update_fields = (
+        phrase_time is not None
+        or phrase_duration is not None
+        or phrase_where is not None
+    )
     file_existed = match_path.exists()
 
     if file_existed:
@@ -2055,12 +2126,13 @@ def add_calendar_match(
             match=phrase_text,
             time=phrase_time,
             duration_minutes=phrase_duration,
+            where_to_watch=phrase_where,
         )
         phrases.append(new_phrase)
         action = "created-file" if action_created else "added"
     else:
         existing = phrases[existing_index]
-        if not wants_schedule:
+        if not wants_update_fields:
             new_phrase = existing
             action = "already-present"
         else:
@@ -2071,6 +2143,11 @@ def add_calendar_match(
                     phrase_duration
                     if phrase_duration is not None
                     else existing.duration_minutes
+                ),
+                where_to_watch=(
+                    phrase_where
+                    if phrase_where is not None
+                    else existing.where_to_watch
                 ),
             )
             phrases[existing_index] = new_phrase
@@ -2141,7 +2218,8 @@ def format_calendar_matches_audit_fail_email(
             '    "default_time": "18:30",',
             '    "phrases": [',
             '      "simple string",',
-            '      {"match": "phrase", "time": "18:30", "duration_minutes": 30}',
+            '      {"match": "phrase", "time": "18:30", "duration_minutes": 30, '
+            '"where_to_watch": "5-1 nbc"}',
             "    ]",
             "  }",
             "",
@@ -2243,6 +2321,7 @@ def run_add_calendar_match(args: argparse.Namespace) -> int:
 
     time_value = getattr(args, "match_time", None)
     duration_value = getattr(args, "match_duration_minutes", None)
+    where_value = getattr(args, "where_to_watch", None)
     dry_run = bool(getattr(args, "dry_run", False))
 
     try:
@@ -2251,6 +2330,7 @@ def run_add_calendar_match(args: argparse.Namespace) -> int:
             match=str(raw_match),
             time=time_value,
             duration_minutes=duration_value,
+            where_to_watch=where_value,
             create_if_missing=True,
             dry_run=dry_run,
         )
@@ -2278,16 +2358,18 @@ def run_add_calendar_match(args: argparse.Namespace) -> int:
 def resolve_calendar_match_options(
     matched_phrases: list[str],
     config: CalendarMatchConfig,
-) -> tuple[CalendarLocalTime | None, int | None, str | None]:
-    """Pick owner time/duration from matched phrases (first hit wins per field).
+) -> tuple[CalendarLocalTime | None, int | None, str | None, str | None]:
+    """Pick owner time/duration/where-to-watch from matched phrases (first hit wins).
 
-    Returns ``(owner_time_or_none, duration_override_or_none, time_source_label)``.
+    Returns
+    ``(owner_time_or_none, duration_override_or_none, time_source_label, where_to_watch)``.
     Time source label is the phrase match text, ``default_time``, or None.
     """
     by_key = config.phrase_by_match_casefold()
     owner_time: CalendarLocalTime | None = None
     time_source: str | None = None
     duration_override: int | None = None
+    where_to_watch: str | None = None
 
     for matched in matched_phrases:
         phrase = by_key.get(str(matched).casefold())
@@ -2298,14 +2380,20 @@ def resolve_calendar_match_options(
             time_source = phrase.match
         if duration_override is None and phrase.duration_minutes is not None:
             duration_override = phrase.duration_minutes
-        if owner_time is not None and duration_override is not None:
+        if where_to_watch is None and phrase.where_to_watch is not None:
+            where_to_watch = phrase.where_to_watch
+        if (
+            owner_time is not None
+            and duration_override is not None
+            and where_to_watch is not None
+        ):
             break
 
     if owner_time is None and config.default_time is not None:
         owner_time = config.default_time
         time_source = "default_time"
 
-    return owner_time, duration_override, time_source
+    return owner_time, duration_override, time_source, where_to_watch
 
 
 def event_calendar_haystack(
@@ -2543,6 +2631,7 @@ def build_calendar_event_body(
     schedule: tuple[datetime | None, str, bool] | None = None,
     owner_time: CalendarLocalTime | None = None,
     owner_time_source: str | None = None,
+    where_to_watch: str | None = None,
     invite_emails: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a Google Calendar events.insert body for one parent mention event.
@@ -2597,6 +2686,9 @@ def build_calendar_event_body(
         f"Event ticker: {event_ticker}",
         f"Matched phrase(s): {', '.join(matched_phrases) if matched_phrases else '(none)'}",
     ]
+    where_text = str(where_to_watch).strip() if where_to_watch is not None else ""
+    if where_text:
+        description_bits.append(f"Where to watch: {where_text}")
     if type_label:
         description_bits.append(f"Mention type: {type_label}")
     url = kalshi_event_url(event)
@@ -2997,8 +3089,8 @@ def maybe_add_calendar_event_for_new_market(
             print(f"calendar skip (no phrase match): {ticker}", file=sys.stderr, flush=True)
         return state
 
-    owner_time, duration_override, owner_time_source = resolve_calendar_match_options(
-        matched, match_config
+    owner_time, duration_override, owner_time_source, where_to_watch = (
+        resolve_calendar_match_options(matched, match_config)
     )
     effective_duration = (
         int(duration_override)
@@ -3016,6 +3108,7 @@ def maybe_add_calendar_event_for_new_market(
             records=records,
             owner_time=owner_time,
             owner_time_source=owner_time_source,
+            where_to_watch=where_to_watch,
             invite_emails=invite_emails,
         )
     except RuntimeError as exc:
@@ -3626,7 +3719,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "One-shot: safely create/update one phrase in --calendar-matches (requires "
-            "--match). Optional is atomic; invalid existing files are refused (not clobbered)."
+            "--match). Optional --time/--duration-minutes/--where-to-watch update fields; "
+            "writes are atomic; invalid existing files are refused (not clobbered)."
         ),
     )
     parser.add_argument(
@@ -3654,6 +3748,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional positive whole-minute duration override for --add-calendar-match; "
             "writes object form when set"
+        ),
+    )
+    parser.add_argument(
+        "--where-to-watch",
+        default=None,
+        metavar="TEXT",
+        dest="where_to_watch",
+        help=(
+            "Optional free-text where-to-watch note for --add-calendar-match "
+            "(e.g. '5-1 nbc'); stored on the phrase and copied into new calendar "
+            "event descriptions; writes object form when set"
         ),
     )
     parser.add_argument(
@@ -3708,6 +3813,7 @@ def main() -> int:
     match_flag_set = getattr(args, "match", None) is not None
     time_flag_set = getattr(args, "match_time", None) is not None
     duration_flag_set = getattr(args, "match_duration_minutes", None) is not None
+    where_flag_set = getattr(args, "where_to_watch", None) is not None
     dry_run_set = bool(getattr(args, "dry_run", False))
     # Detect whether the operator explicitly passed email-on-fail toggles.
     email_on_fail_explicit = any(
@@ -3729,6 +3835,10 @@ def main() -> int:
     if duration_flag_set and not add_mode:
         raise SystemExit(
             "--duration-minutes is only valid together with --add-calendar-match"
+        )
+    if where_flag_set and not add_mode:
+        raise SystemExit(
+            "--where-to-watch is only valid together with --add-calendar-match"
         )
     if dry_run_set and not add_mode:
         raise SystemExit("--dry-run is only valid together with --add-calendar-match")

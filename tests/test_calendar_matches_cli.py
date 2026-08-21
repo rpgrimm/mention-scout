@@ -48,6 +48,7 @@ def _args(**overrides):
         "match": None,
         "match_time": None,
         "match_duration_minutes": None,
+        "where_to_watch": None,
         "dry_run": False,
     }
     base.update(overrides)
@@ -446,3 +447,94 @@ def test_save_round_trip_atomic(tmp_path: Path) -> None:
     assert loaded.phrases[0].match == "a"
     assert loaded.phrases[1].duration_minutes == 15
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+
+def test_add_where_to_watch_creates_object(tmp_path: Path, capsys) -> None:
+    path = tmp_path / "m.json"
+    code = scout.run_add_calendar_match(
+        _args(
+            calendar_matches=path,
+            match="abc world news tonight",
+            where_to_watch="5-1 nbc",
+        )
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "action: created-file" in out
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["phrases"] == [
+        {"match": "abc world news tonight", "where_to_watch": "5-1 nbc"}
+    ]
+
+
+def test_add_where_to_watch_updates_existing(tmp_path: Path, capsys) -> None:
+    path = _write_matches(
+        tmp_path / "m.json",
+        [
+            {
+                "match": "abc world news tonight",
+                "time": "18:30",
+                "duration_minutes": 30,
+            }
+        ],
+        default_time="19:00",
+    )
+    code = scout.run_add_calendar_match(
+        _args(
+            calendar_matches=path,
+            match="ABC World News Tonight",
+            where_to_watch="4-1 cbs",
+        )
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "action: updated" in out
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["default_time"] == "19:00"
+    assert payload["phrases"] == [
+        {
+            "match": "abc world news tonight",
+            "time": "18:30",
+            "duration_minutes": 30,
+            "where_to_watch": "4-1 cbs",
+        }
+    ]
+
+
+def test_add_where_preserves_unspecified_on_time_update(tmp_path: Path) -> None:
+    path = _write_matches(
+        tmp_path / "m.json",
+        [
+            {
+                "match": "abc",
+                "time": "18:30",
+                "where_to_watch": "5-1 nbc",
+            }
+        ],
+    )
+    config, action, phrase = scout.add_calendar_match(
+        path, match="abc", duration_minutes=45
+    )
+    assert action == "updated"
+    assert phrase.time is not None and phrase.time.label() == "18:30"
+    assert phrase.duration_minutes == 45
+    assert phrase.where_to_watch == "5-1 nbc"
+
+
+def test_watch_child_strips_where_to_watch() -> None:
+    child = scout._watch_child_arguments(
+        [
+            "--watch-new",
+            "--calendar-add-new",
+            "--where-to-watch",
+            "5-1 nbc",
+            "--add-calendar-match",
+            "--match",
+            "x",
+        ]
+    )
+    assert "--where-to-watch" not in child
+    assert "5-1 nbc" not in child
+    assert "--add-calendar-match" not in child
+    assert "--match" not in child

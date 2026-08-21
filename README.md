@@ -117,7 +117,8 @@ Schema (v1, MS-0011): plain strings still work; objects may set a local clock ti
     {
       "match": "abc world news tonight",
       "time": "18:30",
-      "duration_minutes": 30
+      "duration_minutes": 30,
+      "where_to_watch": "5-1 nbc"
     }
   ]
 }
@@ -128,6 +129,7 @@ Schema (v1, MS-0011): plain strings still work; objects may set a local clock ti
 - Owner time applies only when Kalshi gives a **date without a reliable clock time**. Real timed Kalshi datetimes are not overridden.
 - If a date-only market matches and no `time` / `default_time` applies, the calendar row stays **all-day** (MS-0010 behavior).
 - Optional phrase `duration_minutes` overrides `--calendar-duration-minutes` for that insert.
+- Optional phrase `where_to_watch` (free text, e.g. `5-1 nbc`) is copied into **new** calendar event descriptions as `Where to watch: …` (first matched phrase wins; not used for matching).
 
 #### Validate match file (MS-0014)
 
@@ -167,6 +169,11 @@ Prefer the helper over hand-editing JSON when adding/updating one phrase:
   --match "abc world news tonight" \
   --time 18:30 \
   --duration-minutes 30
+
+# with where-to-watch (also updates an existing match case-insensitively)
+./mention_scout.py --add-calendar-match \
+  --match "abc world news tonight" \
+  --where-to-watch "5-1 nbc"
 
 # preview only
 ./mention_scout.py --add-calendar-match --match "foo" --time 19:00 --dry-run
