@@ -129,6 +129,56 @@ Schema (v1, MS-0011): plain strings still work; objects may set a local clock ti
 - If a date-only market matches and no `time` / `default_time` applies, the calendar row stays **all-day** (MS-0010 behavior).
 - Optional phrase `duration_minutes` overrides `--calendar-duration-minutes` for that insert.
 
+#### Validate match file (MS-0014)
+
+After hand-edits, validate without starting watch:
+
+```bash
+./mention_scout.py --audit-calendar-matches
+# local-only (no SMTP attempt)
+./mention_scout.py --audit-calendar-matches --no-email-on-fail
+```
+
+- **Success:** stdout summary (`phrases` count, optional `default_time`), exit 0, **no email**.
+- **Failure:** non-zero exit + stderr detail; by default attempts one FAIL email with subject
+  `[Kalshi] FAIL | calendar-matches audit` when SMTP/`~/.config/.google-password` is loadable.
+  Use `--no-email-on-fail` for cron/CI-style checks without mail.
+- This is **config hygiene**. It is separate from **MS-0012** watch-startup FAIL mail
+  (`[Kalshi] FAIL | mention-scout start`, when that ships): different trigger, subject, and body focus.
+  Running audit and later starting watch with a still-bad file can yield two emails — intentional.
+
+Optional daily audit (example only; not installed by the unit helper):
+
+```bash
+# crontab -e
+15 9 * * * /path/to/mention_scout/mention_scout.py --audit-calendar-matches >/tmp/mention-scout-audit.log 2>&1
+```
+
+#### Add a phrase safely (MS-0014)
+
+Prefer the helper over hand-editing JSON when adding/updating one phrase:
+
+```bash
+# plain string entry (no time/duration)
+./mention_scout.py --add-calendar-match --match "cnn this morning"
+
+# object entry with local time + duration
+./mention_scout.py --add-calendar-match \
+  --match "abc world news tonight" \
+  --time 18:30 \
+  --duration-minutes 30
+
+# preview only
+./mention_scout.py --add-calendar-match --match "foo" --time 19:00 --dry-run
+```
+
+- Creates the file (version 1, no invented `default_time`) when missing.
+- Preserves existing phrases + `default_time`; case-insensitive duplicate **updates** when
+  `--time` / `--duration-minutes` are provided, otherwise reports `already-present`.
+- Refuses to write if the existing file is invalid (run `--audit-calendar-matches` to diagnose).
+- Atomic replace (mode `600`). Canonical rewrite may drop unknown top-level keys / reformat whitespace.
+- No email from add mode (stderr only on errors).
+
 ### 2. Google OAuth (desktop client)
 
 1. In Google Cloud Console, create/enable a project with the **Google Calendar API**.
