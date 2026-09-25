@@ -53,6 +53,8 @@ Requirements: **Python 3** (stdlib only). No `pip install` for basic discovery.
 ./mention_scout.py --watch-new --calendar-add-new
 ```
 
+`--watch-new` remembers parent event tickers in `$XDG_STATE_HOME/mention-scout/seen-event-tickers.json` (default `~/.local/state/mention-scout/seen-event-tickers.json`). First run baselines without alerts. After a reboot or another OS, the next start announces (email/calendar) tickers that appeared while it was down. Override the path with `--watch-seen-file`.
+
 ## Mention types
 
 | Filter id (`--type`) | Label in UI / email subject |
