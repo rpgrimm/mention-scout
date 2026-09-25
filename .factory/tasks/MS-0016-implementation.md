@@ -4,6 +4,7 @@ Status: **implemented on branch; PR for owner desktop test; not merged**
 Date: 2026-09-25  
 Branch: `openclaw/ms-0016`  
 Worktree: `/home/candr/.openclaw/factory-worktrees/mention-scout/ms-0016`  
+PR: https://github.com/rpgrimm/mention-scout/pull/25  
 Util version: **1.0.0** (new file; `mention_scout.py` unchanged)
 
 ## What changed
