@@ -5,7 +5,7 @@ Date: 2026-09-25
 Branch: `openclaw/ms-0016`  
 Worktree: `/home/candr/.openclaw/factory-worktrees/mention-scout/ms-0016`  
 PR: https://github.com/rpgrimm/mention-scout/pull/25  
-Util version: **1.0.0** (new file; `mention_scout.py` unchanged)
+Util version: **1.0.1** (new file; `mention_scout.py` unchanged). Default tab delay is **2s** after owner desktop test (Google disliked 0.15s bursts).
 
 ## What changed
 

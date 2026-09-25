@@ -242,6 +242,23 @@ def test_paginated_markets_open_one_tab_per_market(tmp_path: Path, capsys: pytes
     assert sleeps == [0.15, 0.15]
 
 
+def test_default_sleep_is_two_seconds(tmp_path: Path) -> None:
+    path = _write_calendar(tmp_path / "calendar-added.json", SAMPLE_ENTRIES)
+    opener = RecordingOpener()
+    sleeps: list[float] = []
+    code = mm.main(
+        ["target", "KXWORLDNEWSMENTION-26SEP25", "--json", str(path)],
+        opener=opener,
+        urlopen_fn=FakeUrlOpen(_openai_pages()),
+        sleep_fn=sleeps.append,
+        environ={"DISPLAY": ":0"},
+    )
+    assert code == 0
+    assert mm.DEFAULT_SLEEP == 2.0
+    assert sleeps == [2.0, 2.0]
+    assert len(opener.urls) == 3
+
+
 def test_dry_run_never_calls_opener(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     path = _write_calendar(tmp_path / "calendar-added.json", SAMPLE_ENTRIES)
     opener = RecordingOpener()

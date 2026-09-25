@@ -271,7 +271,7 @@ Behavior summary:
 ./mention_markets.py target KXWORLDNEWSMENTION-26SEP25 --action google-news
 ```
 
-Slash phrases become a single query (`OpenAI / Anthropic` → `OpenAI Anthropic news`). Use `--json PATH` to point at a fixture instead of the default calendar-added file. `--dry-run` never opens a browser.
+Slash phrases become a single query (`OpenAI / Anthropic` → `OpenAI Anthropic news`). Tabs open **2 seconds apart** by default (`--sleep 2`); raise it if Google still throttles. Use `--json PATH` to point at a fixture instead of the default calendar-added file. `--dry-run` never opens a browser.
 
 ## Project layout
 

@@ -99,7 +99,7 @@ Examples:
 ## Browser
 
 - Use stdlib `webbrowser.open_new_tab`. Inject an opener in tests.
-- Small delay between tabs (default ~0.15s, `--sleep` optional) so the desktop browser keeps up.
+- Delay between tabs (default **2s**, `--sleep` optional) so Google/desktop browsers keep up. Owner desktop test (2026-09-25) found 0.15s too fast.
 - If `DISPLAY`/`WAYLAND_DISPLAY` is unset and not `--dry-run`, print a warning that this looks headless, still attempt open (owner’s desktop will have a display).
 - Never fail the whole run after a successful fetch just because one tab open returned false; warn and continue.
 

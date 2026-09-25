@@ -22,14 +22,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen as stdlib_urlopen
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 DEFAULT_JSON_PATH = Path.home() / ".config" / "mention-scout" / "calendar-added.json"
 KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 KNOWN_ACTIONS = ("google-news",)
 DEFAULT_ACTION = "google-news"
 DEFAULT_TIMEOUT = 20.0
 DEFAULT_RETRIES = 3
-DEFAULT_SLEEP = 0.15
+DEFAULT_SLEEP = 2.0
 PAGE_LIMIT = 1000
 MAX_PAGES = 20
 TRAILING_TIMES_RE = re.compile(r"\s*\(\d+\+?\s+times\)\s*$", re.IGNORECASE)
