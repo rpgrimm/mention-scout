@@ -255,12 +255,31 @@ Behavior summary:
 ./mention_scout.py --version
 ```
 
+## Mention markets util
+
+`./mention_markets.py` is a separate desktop helper for events already recorded in `~/.config/mention-scout/calendar-added.json`. It lists those event tickers, fetches that event's mention markets from **Kalshi public REST** (unauthenticated GET only), and opens a Google search tab per market word. Discovery only — **no trading**.
+
+```bash
+# Events already added to calendar (newest first)
+./mention_markets.py list
+
+# Preview Google News URLs without opening a browser
+./mention_markets.py target KXWORLDNEWSMENTION-26SEP25 --dry-run
+
+# Open one Google "{word} news" tab per active/open market (desktop)
+./mention_markets.py target KXWORLDNEWSMENTION-26SEP25
+./mention_markets.py target KXWORLDNEWSMENTION-26SEP25 --action google-news
+```
+
+Slash phrases become a single query (`OpenAI / Anthropic` → `OpenAI Anthropic news`). Tabs open **2 seconds apart** by default (`--sleep 2`); raise it if Google still throttles. Use `--json PATH` to point at a fixture instead of the default calendar-added file. `--dry-run` never opens a browser.
+
 ## Project layout
 
 | Path | Role |
 |------|------|
 | `./mention_scout.py` | Stable entry (symlink) |
 | `kalshi_mention_scout.py` | Implementation (v16) |
+| `./mention_markets.py` | Calendar-added events → Google News tabs (MS-0016) |
 | `deploy/systemd/` | User unit template (placeholders) |
 | `deploy/config/calendar-matches.example.json` | Example calendar phrase list (copy to `~/.config/mention-scout/`) |
 | `scripts/install-user-service.sh` | Install/update/disable user watch unit |
