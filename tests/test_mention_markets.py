@@ -165,6 +165,55 @@ def test_google_news_query_cleaning(word: str, query: str) -> None:
     assert mm.google_news_query(word) == query
 
 
+@pytest.mark.parametrize(
+    ("ticker", "mode"),
+    [
+        ("KXWORLDNEWSMENTION-26SEP25", "world-news"),
+        ("kxworldnewsmention-26sep25::primary", "world-news"),
+        ("KXMTPMENTION-26SEP06", "interview"),
+        ("KXFNSMENTION-26SEP06", "interview"),
+        ("KXFTNMENTION-26SEP06", "interview"),
+    ],
+)
+def test_infer_mode_from_ticker(ticker: str, mode: str) -> None:
+    assert mm.infer_mode(ticker) == mode
+
+
+def test_normalize_mode_aliases() -> None:
+    assert mm.normalize_mode("abc") == "world-news"
+    assert mm.normalize_mode("WNT") == "world-news"
+    assert mm.normalize_mode("interview") == "interview"
+    assert mm.normalize_mode("mtp") == "interview"
+    with pytest.raises(mm.MentionMarketsError):
+        mm.normalize_mode("trade")
+
+
+def test_guest_from_title() -> None:
+    assert mm.guest_from_title("What will Jamie Raskin say during Meet the Press?") == "Jamie Raskin"
+    assert mm.guest_from_title("Jamie Raskin - Meet the Press") == "Jamie Raskin"
+    assert (
+        mm.guest_from_title(
+            "What will any host or reporter say during ABC World News Tonight originally scheduled for September 25, 2026?"
+        )
+        is None
+    )
+
+
+def test_interview_query_is_guest_plus_word_not_show() -> None:
+    assert (
+        mm.google_query_for_word(
+            "OpenAI / Anthropic",
+            mode="interview",
+            guest="Jamie Raskin",
+        )
+        == "Jamie Raskin OpenAI Anthropic"
+    )
+    assert "Meet the Press" not in mm.google_query_for_word(
+        "Republican", mode="interview", guest="Jamie Raskin"
+    )
+    assert mm.google_query_for_word("Starbucks", mode="world-news", guest=None) == "Starbucks news"
+
+
 def test_market_word_prefers_slash_subtitle() -> None:
     market = {
         "ticker": "KXWORLDNEWSMENTION-26SEP25-OPENAI",
@@ -281,6 +330,112 @@ def test_dry_run_never_calls_opener(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert "OpenAI / Anthropic" in captured.out
     assert "dry-run: 3 tabs" in captured.err
     assert "headless" not in captured.err
+    assert "mode: world-news" in captured.err
+
+
+def _mtp_pages() -> dict[str, dict[str, Any]]:
+    title = "What will Jamie Raskin say during Meet the Press?"
+    return {
+        "": {
+            "markets": [
+                {
+                    "ticker": "KXMTPMENTION-26SEP20-REPU",
+                    "status": "active",
+                    "title": title,
+                    "yes_sub_title": "Republican",
+                },
+                {
+                    "ticker": "KXMTPMENTION-26SEP20-OPENAI",
+                    "status": "open",
+                    "title": title,
+                    "yes_sub_title": "OpenAI / Anthropic",
+                },
+            ],
+            "cursor": "",
+        }
+    }
+
+
+def test_interview_auto_mode_uses_guest_and_not_show(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _write_calendar(tmp_path / "calendar-added.json", SAMPLE_ENTRIES)
+    opener = RecordingOpener()
+    code = mm.main(
+        ["target", "KXMTPMENTION-26SEP20", "--dry-run", "--json", str(path)],
+        opener=opener,
+        urlopen_fn=FakeUrlOpen(_mtp_pages()),
+        sleep_fn=lambda _s: None,
+        environ={"DISPLAY": ":0"},
+    )
+    assert code == 0
+    captured = capsys.readouterr()
+    assert opener.urls == []
+    assert "mode: interview (Jamie Raskin)" in captured.err
+    assert "q=Jamie+Raskin+Republican" in captured.out or "q=Jamie%20Raskin%20Republican" in captured.out
+    assert "q=Jamie+Raskin+OpenAI+Anthropic" in captured.out or "q=Jamie%20Raskin%20OpenAI%20Anthropic" in captured.out
+    assert "Meet+the+Press" not in captured.out
+    assert "Meet%20the%20Press" not in captured.out
+    for line in captured.out.splitlines():
+        assert "Meet the Press" not in line
+        _, url = line.split("\t", 1)
+        assert "news" not in url.lower().split("q=", 1)[-1]
+
+
+def test_mode_override_world_news_on_interview_ticker(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _write_calendar(tmp_path / "calendar-added.json", SAMPLE_ENTRIES)
+    code = mm.main(
+        [
+            "target",
+            "KXMTPMENTION-26SEP20",
+            "--mode",
+            "abc",
+            "--dry-run",
+            "--json",
+            str(path),
+        ],
+        opener=RecordingOpener(),
+        urlopen_fn=FakeUrlOpen(_mtp_pages()),
+        sleep_fn=lambda _s: None,
+        environ={"DISPLAY": ":0"},
+    )
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "mode: world-news" in captured.err
+    assert "q=Republican+news" in captured.out or "q=Republican%20news" in captured.out
+
+
+def test_interview_missing_guest_exits_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _write_calendar(tmp_path / "calendar-added.json", SAMPLE_ENTRIES)
+    pages = {
+        "": {
+            "markets": [
+                {
+                    "ticker": "KXMTPMENTION-26SEP20-REPU",
+                    "status": "active",
+                    "title": "What will any host or reporter say during Meet the Press?",
+                    "yes_sub_title": "Republican",
+                }
+            ],
+            "cursor": "",
+        }
+    }
+    opener = RecordingOpener()
+    code = mm.main(
+        ["target", "KXMTPMENTION-26SEP20", "--json", str(path)],
+        opener=opener,
+        urlopen_fn=FakeUrlOpen(pages),
+        sleep_fn=lambda _s: None,
+        environ={"DISPLAY": ":0"},
+    )
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "interview mode needs a guest name" in err
+    assert opener.urls == []
 
 
 def test_inactive_unopened_markets_are_not_opened(

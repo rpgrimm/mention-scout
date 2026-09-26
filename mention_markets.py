@@ -22,11 +22,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen as stdlib_urlopen
 
-VERSION = "1.0.1"
+VERSION = "1.1.2"
 DEFAULT_JSON_PATH = Path.home() / ".config" / "mention-scout" / "calendar-added.json"
 KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 KNOWN_ACTIONS = ("google-news",)
 DEFAULT_ACTION = "google-news"
+DEFAULT_MODE = "auto"
 DEFAULT_TIMEOUT = 20.0
 DEFAULT_RETRIES = 3
 DEFAULT_SLEEP = 2.0
@@ -34,6 +35,32 @@ PAGE_LIMIT = 1000
 MAX_PAGES = 20
 TRAILING_TIMES_RE = re.compile(r"\s*\(\d+\+?\s+times\)\s*$", re.IGNORECASE)
 SLASH_RE = re.compile(r"[/\\]")
+WHAT_WILL_SAY_RE = re.compile(
+    r"^\s*What will (?P<name>.+?) say during\b",
+    re.IGNORECASE,
+)
+NON_GUEST_NAMES = {
+    "any host or reporter",
+    "any host",
+    "the reporters",
+    "reporters",
+}
+MODE_ALIASES = {
+    "auto": "auto",
+    "world-news": "world-news",
+    "world_news": "world-news",
+    "worldnews": "world-news",
+    "abc": "world-news",
+    "wnt": "world-news",
+    "abc-world-news": "world-news",
+    "news": "world-news",
+    "interview": "interview",
+    "guest": "interview",
+    "mtp": "interview",
+    "ftn": "interview",
+    "fns": "interview",
+}
+WORLD_NEWS_TICKER_PREFIX = "KXWORLDNEWSMENTION"
 
 urlopen = stdlib_urlopen
 Opener = Callable[[str], Any]
@@ -161,14 +188,96 @@ def market_word(market: dict[str, Any]) -> str:
     return str(word)
 
 
-def google_news_query(word: str) -> str:
-    """Turn a market word into a Google ``{cleaned} news`` query."""
+def clean_market_word(word: str) -> str:
+    """Flatten slashes and strip trailing ``(N+ times)`` from a market word."""
     cleaned = str(word or "").replace("/", " ").replace("\\", " ")
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     cleaned = TRAILING_TIMES_RE.sub("", cleaned).strip()
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def google_news_query(word: str) -> str:
+    """Turn a market word into a Google ``{cleaned} news`` query (world-news mode)."""
+    return google_query_for_word(word, mode="world-news", guest=None)
+
+
+def normalize_mode(value: str) -> str:
+    """Map CLI aliases to ``auto``, ``world-news``, or ``interview``."""
+    key = str(value or "").strip().casefold().replace(" ", "-")
+    if key not in MODE_ALIASES:
+        known = ", ".join(sorted(set(MODE_ALIASES.values())))
+        raise MentionMarketsError(f"Unknown mode {value!r}. Known modes: {known}")
+    return MODE_ALIASES[key]
+
+
+def infer_mode(ticker: str) -> str:
+    """World News Tonight tickers use word-only searches; other shows are interviews."""
+    if ticker_from_key(ticker).upper().startswith(WORLD_NEWS_TICKER_PREFIX):
+        return "world-news"
+    return "interview"
+
+
+def resolve_mode(requested: str, ticker: str, *, guest: str | None) -> str:
+    """Resolve ``auto`` from the event ticker; ``--guest`` implies interview unless overridden."""
+    mode = normalize_mode(requested)
+    explicit_guest = bool(str(guest or "").strip())
+    if mode == "auto":
+        if explicit_guest:
+            return "interview"
+        return infer_mode(ticker)
+    return mode
+
+
+def guest_from_title(title: str) -> str | None:
+    """Extract ``Jamie Raskin`` from Kalshi titles; never return the show name."""
+    text = re.sub(r"\s+", " ", str(title or "")).strip()
+    if not text:
+        return None
+    match = WHAT_WILL_SAY_RE.search(text)
+    if match:
+        name = re.sub(r"\s+", " ", match.group("name")).strip(" .")
+        if name and name.casefold() not in NON_GUEST_NAMES:
+            return name
+        return None
+    if " - " in text:
+        left, right = text.split(" - ", 1)
+        left = left.strip()
+        right = right.strip()
+        if left and left.casefold() not in NON_GUEST_NAMES and right:
+            return left
+    return None
+
+
+def extract_guest_name(markets: list[dict[str, Any]]) -> str | None:
+    """Return a single guest name shared by market titles, or None."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for market in markets:
+        for field in ("title", "yes_sub_title", "subtitle"):
+            name = guest_from_title(str(market.get(field) or ""))
+            if not name:
+                continue
+            key = name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(name)
+            break
+    if len(names) == 1:
+        return names[0]
+    return None
+
+
+def google_query_for_word(word: str, *, mode: str, guest: str | None) -> str:
+    """Build the Google query for one market word in the resolved mode."""
+    cleaned = clean_market_word(word)
     if not cleaned:
         return ""
+    if mode == "interview":
+        host = re.sub(r"\s+", " ", str(guest or "")).strip()
+        if not host:
+            return ""
+        return f"{host} {cleaned}"
     return f"{cleaned} news"
 
 
@@ -287,8 +396,8 @@ def fetch_markets_rest_paginated(
     return markets
 
 
-def news_tabs_for_markets(markets: list[dict[str, Any]]) -> list[NewsTab]:
-    """Build one Google News tab per unique active/open market ticker."""
+def usable_markets(markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Unique active/open markets, first ticker wins."""
     by_ticker: dict[str, dict[str, Any]] = {}
     for market in markets:
         if not is_open_market(market):
@@ -297,18 +406,46 @@ def news_tabs_for_markets(markets: list[dict[str, Any]]) -> list[NewsTab]:
         if not ticker or ticker in by_ticker:
             continue
         by_ticker[ticker] = market
+    return list(by_ticker.values())
 
+
+def news_tabs_for_markets(
+    markets: list[dict[str, Any]],
+    *,
+    mode: str,
+    guest: str | None,
+) -> list[NewsTab]:
+    """Build Google tabs for active/open market words, plus guest news in interview mode."""
     tabs: list[NewsTab] = []
-    for ticker, market in by_ticker.items():
+
+    if mode == "interview":
+        normalized_guest = re.sub(r"\\s+", " ", str(guest or "")).strip()
+        if normalized_guest:
+            tabs.append(
+                NewsTab(
+                    word=f"{normalized_guest} news",
+                    url=google_search_url(f"{normalized_guest} news"),
+                    ticker="__guest_news__",
+                )
+            )
+
+    for market in usable_markets(markets):
+        ticker = str(market.get("ticker") or "").strip()
         word = market_word(market).strip()
         if not word or word.casefold() == "unknown":
             continue
-        query = google_news_query(word)
+        query = google_query_for_word(word, mode=mode, guest=guest)
         if not query:
             continue
         tabs.append(NewsTab(word=word, url=google_search_url(query), ticker=ticker))
 
-    tabs.sort(key=lambda tab: (tab.word.casefold(), tab.ticker))
+    tabs.sort(
+        key=lambda tab: (
+            0 if tab.ticker == "__guest_news__" else 1,
+            tab.word.casefold(),
+            tab.ticker,
+        )
+    )
     return tabs
 
 
@@ -353,6 +490,8 @@ def cmd_target(
     requested_ticker: str,
     *,
     action: str,
+    mode: str,
+    guest: str | None,
     dry_run: bool,
     sleep: float,
     opener: Opener | None,
@@ -380,7 +519,23 @@ def cmd_target(
         urlopen_fn=urlopen_fn,
         sleep_fn=sleep_fn,
     )
-    tabs = news_tabs_for_markets(markets)
+    open_markets = usable_markets(markets)
+    resolved_mode = resolve_mode(mode, event.ticker, guest=guest)
+    resolved_guest = re.sub(r"\s+", " ", str(guest or "")).strip() or None
+    if resolved_mode == "interview" and not resolved_guest:
+        resolved_guest = extract_guest_name(open_markets) or extract_guest_name(markets)
+        if not resolved_guest:
+            raise MentionMarketsError(
+                f"interview mode needs a guest name for {event.ticker} "
+                "(title like 'What will Jamie Raskin say during Meet the Press?' "
+                "or 'Jamie Raskin - Meet the Press'). Pass --guest 'First Last'."
+            )
+    if resolved_mode == "world-news":
+        print(f"mode: world-news", file=sys.stderr)
+    else:
+        print(f"mode: interview ({resolved_guest})", file=sys.stderr)
+
+    tabs = news_tabs_for_markets(markets, mode=resolved_mode, guest=resolved_guest)
     if not tabs:
         print(
             f"No active/open mention markets with usable words for {event.ticker}",
@@ -446,6 +601,21 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Action to run (default: {DEFAULT_ACTION}; known: {', '.join(KNOWN_ACTIONS)})",
     )
     target_parser.add_argument(
+        "--mode",
+        default=DEFAULT_MODE,
+        help=(
+            "Search mode: auto (default; World News Tonight tickers → world-news, "
+            "else interview), world-news/abc/wnt, or interview. "
+            "world-news queries '{word} news'; interview queries '{guest} {word}' "
+            "and never includes the show name."
+        ),
+    )
+    target_parser.add_argument(
+        "--guest",
+        default="",
+        help="Interview guest name override (implies interview mode unless --mode world-news)",
+    )
+    target_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Fetch and print word/url pairs; do not open a browser",
@@ -487,6 +657,8 @@ def main(
             args.json_path,
             args.event_ticker,
             action=str(args.action).strip() or DEFAULT_ACTION,
+            mode=str(getattr(args, "mode", DEFAULT_MODE) or DEFAULT_MODE),
+            guest=str(getattr(args, "guest", "") or "") or None,
             dry_run=bool(args.dry_run),
             sleep=float(args.sleep),
             opener=opener,

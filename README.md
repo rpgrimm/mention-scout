@@ -271,7 +271,18 @@ Behavior summary:
 ./mention_markets.py target KXWORLDNEWSMENTION-26SEP25 --action google-news
 ```
 
-Slash phrases become a single query (`OpenAI / Anthropic` → `OpenAI Anthropic news`). Tabs open **2 seconds apart** by default (`--sleep 2`); raise it if Google still throttles. Use `--json PATH` to point at a fixture instead of the default calendar-added file. `--dry-run` never opens a browser.
+Search **mode** defaults from the event ticker (`--mode auto`):
+
+- `KXWORLDNEWSMENTION-*` → `world-news` / `abc` / `wnt`: query `{word} news` (the market word by itself).
+- Other shows (Meet the Press, Face the Nation, Fox News Sunday, …) → `interview`: query `{guest} {word}`. Guest is parsed from the Kalshi title (`What will Jamie Raskin say during Meet the Press?` or `Jamie Raskin - Meet the Press`). **Never** googles the show name.
+
+```bash
+./mention_markets.py target KXMTPMENTION-26SEP20 --dry-run
+./mention_markets.py target KXMTPMENTION-26SEP20 --mode interview --guest "Jamie Raskin"
+./mention_markets.py target KXWORLDNEWSMENTION-26SEP25 --mode abc --dry-run
+```
+
+Slash phrases become a single query (`OpenAI / Anthropic` → spaces). Tabs open **2 seconds apart** by default (`--sleep 2`). Use `--json PATH` for a fixture. `--dry-run` never opens a browser.
 
 ## Project layout
 
