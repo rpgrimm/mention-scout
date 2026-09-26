@@ -40,6 +40,15 @@ Changes in v10:
   * Bumps the cache format so a v9 compact cache is rebuilt once with the
     corrected query-status marker.
 
+Changes in v16.4 / MS-0018:
+  * --watch-new persists seen parent event tickers under
+    $XDG_STATE_HOME/mention-scout/seen-event-tickers.json (default
+    ~/.local/state/mention-scout/seen-event-tickers.json). First run baselines
+    without alerts. Later startups announce (email/calendar) tickers created
+    while the scout was down, then keep the in-process watch loop. Each sent
+    alert is marked alert_sent; events whose schedule is already in the past
+    are recorded as skipped and never alerted.
+
 Changes in v16.3 / MS-0015:
   * calendar-matches phrase objects may set optional where_to_watch (free text,
     e.g. "5-1 nbc"). --add-calendar-match accepts --where-to-watch and updates
@@ -129,13 +138,14 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-VERSION = "16.3.0"
+VERSION = "16.4.0"
 CACHE_FORMAT_VERSION = 5
 DEFAULT_MENTION_CACHE_FILE = ".kalshi_mention_scout_mentions_cache.json"
 DEFAULT_FULL_CACHE_FILE = ".kalshi_mention_scout_full_cache.json"
 DEFAULT_CACHE_TTL_SECONDS = 300.0
 DEFAULT_OPEN_QUEUE_DIR = "mention_open_queue"
 QUEUE_FORMAT_VERSION = 1
+WATCH_SEEN_FILE_VERSION = 2
 DEFAULT_GOOGLE_PASSWORD_FILE = Path("~/.config/.google-password")
 DEFAULT_MENTION_SCOUT_CONFIG_DIR = Path("~/.config/mention-scout")
 DEFAULT_CALENDAR_MATCHES_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "calendar-matches.json"
@@ -846,6 +856,164 @@ def write_cache_atomic(cache_path: Path, payload: dict[str, Any]) -> None:
             pass
 
 
+def default_watch_seen_path() -> Path:
+    """XDG state dir for --watch-new seen tickers (not config, not cache)."""
+    raw = str(os.environ.get("XDG_STATE_HOME") or "").strip()
+    root = Path(raw).expanduser() if raw else Path.home() / ".local" / "state"
+    return root / "mention-scout" / "seen-event-tickers.json"
+
+
+@dataclass
+class WatchSeenEntry:
+    """One persisted parent ticker: seen, and whether an alert was sent."""
+
+    ticker: str
+    first_seen_utc: str
+    alert_sent: bool = False
+    alert_sent_utc: str | None = None
+    skipped_past: bool = False
+    baselined: bool = False
+
+    def handled(self) -> bool:
+        return bool(self.alert_sent or self.skipped_past or self.baselined)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "first_seen_utc": self.first_seen_utc,
+            "alert_sent": bool(self.alert_sent),
+            "alert_sent_utc": self.alert_sent_utc,
+            "skipped_past": bool(self.skipped_past),
+            "baselined": bool(self.baselined),
+        }
+
+
+def _utc_stamp(now: datetime | None = None) -> str:
+    value = now if now is not None else datetime.now(timezone.utc)
+    return iso_utc(value.astimezone(timezone.utc))
+
+
+def watch_seen_entry_from_payload(ticker: str, payload: dict[str, Any]) -> WatchSeenEntry:
+    return WatchSeenEntry(
+        ticker=ticker,
+        first_seen_utc=str(payload.get("first_seen_utc") or ""),
+        alert_sent=bool(payload.get("alert_sent")),
+        alert_sent_utc=str(payload["alert_sent_utc"]) if payload.get("alert_sent_utc") else None,
+        skipped_past=bool(payload.get("skipped_past")),
+        baselined=bool(payload.get("baselined")),
+    )
+
+
+def load_watch_seen_state(path: Path) -> tuple[dict[str, WatchSeenEntry], bool]:
+    """Load persisted watch entries. Missing file => empty, no prior state."""
+    state_path = path.expanduser()
+    if not state_path.exists():
+        return {}, False
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"watch seen-state is not valid JSON ({state_path}): {exc.msg}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"cannot read watch seen-state {state_path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"watch seen-state must be a JSON object: {state_path}")
+    version = payload.get("version")
+    if version not in (1, WATCH_SEEN_FILE_VERSION):
+        raise RuntimeError(
+            f"watch seen-state version must be 1 or {WATCH_SEEN_FILE_VERSION} "
+            f"(got {version!r}) in {state_path}"
+        )
+    entries: dict[str, WatchSeenEntry] = {}
+    stamp = _utc_stamp()
+    if version == 1:
+        raw_tickers = payload.get("tickers")
+        if not isinstance(raw_tickers, list):
+            raise RuntimeError(f"watch seen-state 'tickers' must be an array: {state_path}")
+        for item in raw_tickers:
+            ticker = str(item or "").strip()
+            if ticker:
+                entries[ticker] = WatchSeenEntry(
+                    ticker=ticker,
+                    first_seen_utc=stamp,
+                    baselined=True,
+                )
+        return entries, True
+    raw_entries = payload.get("entries")
+    if not isinstance(raw_entries, dict):
+        raise RuntimeError(f"watch seen-state 'entries' must be an object: {state_path}")
+    for key, value in raw_entries.items():
+        ticker = str(key or "").strip()
+        if not ticker:
+            continue
+        if not isinstance(value, dict):
+            raise RuntimeError(f"watch seen-state entry {key!r} must be an object: {state_path}")
+        entries[ticker] = watch_seen_entry_from_payload(ticker, value)
+    return entries, True
+
+
+def load_watch_seen_tickers(path: Path) -> tuple[set[str], bool]:
+    """Load persisted parent tickers. Missing file => empty set, no prior state."""
+    entries, have_prior = load_watch_seen_state(path)
+    return set(entries), have_prior
+
+
+def save_watch_seen_state(path: Path, entries: dict[str, WatchSeenEntry]) -> None:
+    """Atomically persist watch seen entries (mode 0600)."""
+    payload = {
+        "version": WATCH_SEEN_FILE_VERSION,
+        "updated_at_utc": _utc_stamp(),
+        "entries": {
+            ticker: entries[ticker].to_payload()
+            for ticker in sorted(entries)
+        },
+    }
+    write_cache_atomic(path.expanduser(), payload)
+
+
+def save_watch_seen_tickers(path: Path, tickers: Iterable[str]) -> None:
+    """Persist tickers as first-run baselines (test/helper)."""
+    stamp = _utc_stamp()
+    entries = {
+        ticker: WatchSeenEntry(ticker=ticker, first_seen_utc=stamp, baselined=True)
+        for ticker in sorted({str(item).strip() for item in tickers if str(item).strip()})
+    }
+    save_watch_seen_state(path, entries)
+
+
+def merge_watch_seen_tickers(
+    current: Iterable[str],
+    saved: set[str],
+    *,
+    have_prior_state: bool,
+) -> tuple[set[str], list[str]]:
+    """Return (known, new). First run baselines with no catch-up alerts."""
+    current_set = {str(item).strip() for item in current if str(item).strip()}
+    if not have_prior_state:
+        return set(current_set), []
+    new_tickers = sorted(current_set - saved)
+    return set(saved) | current_set, new_tickers
+
+
+def watch_event_is_past(
+    event: dict[str, Any],
+    records: list[dict[str, Any]],
+    *,
+    now: datetime,
+    local_tz: ZoneInfo,
+) -> bool:
+    """True when the mention event's schedule is already in the past (no alert)."""
+    start, _source, date_only = resolve_calendar_schedule(event, records, local_tz)
+    if start is None:
+        return False
+    now_utc = now.astimezone(timezone.utc)
+    start_local = start.astimezone(local_tz)
+    now_local = now_utc.astimezone(local_tz)
+    if date_only:
+        return start_local.date() < now_local.date()
+    return start.astimezone(timezone.utc) <= now_utc
+
+
 def build_cache_payload(
     base_url: str,
     statuses: tuple[str, ...],
@@ -1420,6 +1588,7 @@ def _watch_child_arguments(original_argv: list[str]) -> list[str]:
         "--smtp-server",
         "--smtp-auth-user",
         "--queue-dir",
+        "--watch-seen-file",
         "--google-password-file",
         "--calendar-matches",
         "--calendar-client-secret",
@@ -3303,8 +3472,9 @@ def watch_new_events(args: argparse.Namespace, original_argv: list[str]) -> int:
 
     A "new market" in this mode is a new *parent Kalshi event ticker*.  This
     avoids false alarms when an already-known event's quote or status changes.
-    The initial inventory is a baseline: it is displayed but never announced as
-    newly created.  Ctrl-C exits cleanly.
+    Seen tickers are persisted under XDG state. First run baselines the current
+    inventory with no alerts. Later startups announce tickers created while the
+    process was down. Ctrl-C exits cleanly.
     """
     if args.flat:
         raise SystemExit("--watch-new prints an overview and cannot be combined with --flat")
@@ -3360,7 +3530,7 @@ def watch_new_events(args: argparse.Namespace, original_argv: list[str]) -> int:
     status_filter = snapshot.get("status_filter") or "upcoming"
 
     print(color("Kalshi mention-market scout watch", "bold", colors))
-    print("baseline: current overview shown below; existing events do not trigger an alert")
+    print("baseline: current overview shown below")
     print(
         f"watching: {len(event_map)} event(s) / {summary.get('matching_contract_count', 0)} contract(s) "
         f"| status: {status_filter} | refresh: every {effective_poll:g}s | Ctrl-C to stop"
@@ -3368,6 +3538,36 @@ def watch_new_events(args: argparse.Namespace, original_argv: list[str]) -> int:
     print(f"started: {format_local_time(generated_at, local_tz)}")
     print()
     render_overview(list(event_map.values()), colors)
+
+    seen_override = getattr(args, "watch_seen_file", None)
+    seen_path = Path(seen_override).expanduser() if seen_override else default_watch_seen_path()
+    try:
+        seen_entries, have_prior_state = load_watch_seen_state(seen_path)
+    except RuntimeError as exc:
+        raise SystemExit(f"watch seen-state error: {exc}") from exc
+    if have_prior_state:
+        pending_startup = [
+            ticker for ticker in event_map if ticker not in seen_entries or not seen_entries[ticker].handled()
+        ]
+        print(
+            f"seen-state: {seen_path} ({len(seen_entries)} saved; "
+            f"{len(pending_startup)} to consider for catch-up)",
+            flush=True,
+        )
+    else:
+        stamp = _utc_stamp(generated_at)
+        for ticker in event_map:
+            seen_entries[ticker] = WatchSeenEntry(
+                ticker=ticker,
+                first_seen_utc=stamp,
+                baselined=True,
+            )
+        pending_startup = []
+        print(
+            f"seen-state: {seen_path} (first run; baselining {len(event_map)} ticker(s), "
+            "no catch-up alerts)",
+            flush=True,
+        )
 
     queue_dir = args.queue_dir.expanduser()
     initial_queued = 0
@@ -3392,9 +3592,114 @@ def watch_new_events(args: argparse.Namespace, original_argv: list[str]) -> int:
             flush=True,
         )
 
+    def _sort_new_tickers(tickers: Iterable[str], events: dict[str, dict[str, Any]]) -> list[str]:
+        return sorted(
+            {str(item).strip() for item in tickers if str(item).strip()},
+            key=lambda ticker: (
+                parse_iso(events.get(ticker, {}).get("first_event_time_utc"))
+                or parse_iso(events.get(ticker, {}).get("first_close_time_utc"))
+                or datetime.max.replace(tzinfo=timezone.utc),
+                ticker,
+            ),
+        )
+
+    def _persist_seen() -> None:
+        save_watch_seen_state(seen_path, seen_entries)
+
+    def _entry_for(ticker: str, when: datetime) -> WatchSeenEntry:
+        entry = seen_entries.get(ticker)
+        if entry is None:
+            entry = WatchSeenEntry(ticker=ticker, first_seen_utc=_utc_stamp(when))
+            seen_entries[ticker] = entry
+        return entry
+
+    def _announce_new(
+        new_tickers: list[str],
+        events: dict[str, dict[str, Any]],
+        snap: dict[str, Any],
+        detected_at: datetime,
+        current_sort: str,
+    ) -> None:
+        nonlocal calendar_state
+        for ticker in new_tickers:
+            event = events[ticker]
+            entry = _entry_for(ticker, detected_at)
+            if entry.handled():
+                continue
+            records = _watch_records_for_event(snap, ticker)
+            if watch_event_is_past(event, records, now=detected_at, local_tz=local_tz):
+                entry.skipped_past = True
+                print(f"skip: {ticker} event is in the past; no alert", flush=True)
+                continue
+            render_watch_new_event(
+                event,
+                records,
+                colors,
+                current_sort,
+                detected_at,
+                local_tz,
+            )
+            alert_ok = True
+            if args.email_new:
+                try:
+                    send_new_market_email(
+                        event,
+                        detected_at,
+                        local_tz,
+                        args.email_to,
+                        args.email_from,
+                        args.smtp_server,
+                        args.smtp_auth_user,
+                        args._google_password,
+                        args.verbose,
+                    )
+                except RuntimeError as exc:
+                    alert_ok = False
+                    print(
+                        color(f"email alert failed for {ticker}: {exc}", "red", colors),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            if args.calendar_add_new and calendar_client is not None and calendar_match_cache is not None:
+                calendar_state = maybe_add_calendar_event_for_new_market(
+                    args=args,
+                    event=event,
+                    records=records,
+                    detected_at=detected_at,
+                    local_tz=local_tz,
+                    match_cache=calendar_match_cache,
+                    calendar_client=calendar_client,
+                    state=calendar_state if calendar_state is not None else {
+                        "version": CALENDAR_STATE_FILE_VERSION,
+                        "entries": {},
+                    },
+                    email_password=args._google_password,
+                    colors=colors,
+                )
+            if alert_ok:
+                entry.alert_sent = True
+                entry.alert_sent_utc = _utc_stamp(detected_at)
+
+    if pending_startup:
+        print(
+            f"catch-up: considering {len(pending_startup)} parent event(s) created while down",
+            flush=True,
+        )
+        _announce_new(
+            _sort_new_tickers(pending_startup, event_map),
+            event_map,
+            snapshot,
+            generated_at,
+            sort_by,
+        )
+
+    try:
+        _persist_seen()
+    except OSError as exc:
+        raise SystemExit(f"watch seen-state write failed ({seen_path}): {exc}") from exc
+
     print(f"Watching for new parent markets. Next refresh in {effective_poll:g} seconds.", flush=True)
 
-    known_event_tickers = set(event_map)
     while True:
         try:
             time.sleep(effective_poll)
@@ -3410,17 +3715,14 @@ def watch_new_events(args: argparse.Namespace, original_argv: list[str]) -> int:
             continue
 
         current_events = _watch_event_map(snapshot)
-        new_tickers = sorted(
-            set(current_events) - known_event_tickers,
-            key=lambda ticker: (
-                parse_iso(current_events[ticker].get("first_event_time_utc"))
-                or parse_iso(current_events[ticker].get("first_close_time_utc"))
-                or datetime.max.replace(tzinfo=timezone.utc),
-                ticker,
-            ),
+        detected_at = parse_iso(snapshot.get("generated_at_utc")) or datetime.now(timezone.utc)
+        for ticker in current_events:
+            _entry_for(ticker, detected_at)
+        new_tickers = _sort_new_tickers(
+            [ticker for ticker, entry in seen_entries.items() if ticker in current_events and not entry.handled()],
+            current_events,
         )
         current_sort = str((snapshot.get("summary") or {}).get("sort") or "event")
-        detected_at = parse_iso(snapshot.get("generated_at_utc")) or datetime.now(timezone.utc)
 
         if args.queue_initialized:
             queued_now = 0
@@ -3442,51 +3744,7 @@ def watch_new_events(args: argparse.Namespace, original_argv: list[str]) -> int:
                 print(f"initialized queue checked for {queued_now} event(s)", flush=True)
 
         if new_tickers:
-            for ticker in new_tickers:
-                event = current_events[ticker]
-                render_watch_new_event(
-                    event,
-                    _watch_records_for_event(snapshot, ticker),
-                    colors,
-                    current_sort,
-                    detected_at,
-                    local_tz,
-                )
-                if args.email_new:
-                    try:
-                        send_new_market_email(
-                            event,
-                            detected_at,
-                            local_tz,
-                            args.email_to,
-                            args.email_from,
-                            args.smtp_server,
-                            args.smtp_auth_user,
-                            args._google_password,
-                            args.verbose,
-                        )
-                    except RuntimeError as exc:
-                        print(
-                            color(f"email alert failed for {ticker}: {exc}", "red", colors),
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                if args.calendar_add_new and calendar_client is not None and calendar_match_cache is not None:
-                    calendar_state = maybe_add_calendar_event_for_new_market(
-                        args=args,
-                        event=event,
-                        records=_watch_records_for_event(snapshot, ticker),
-                        detected_at=detected_at,
-                        local_tz=local_tz,
-                        match_cache=calendar_match_cache,
-                        calendar_client=calendar_client,
-                        state=calendar_state if calendar_state is not None else {
-                            "version": CALENDAR_STATE_FILE_VERSION,
-                            "entries": {},
-                        },
-                        email_password=args._google_password,
-                        colors=colors,
-                    )
+            _announce_new(new_tickers, current_events, snapshot, detected_at, current_sort)
         elif args.verbose:
             print(
                 f"[{format_local_time(detected_at, local_tz)}] no new parent markets "
@@ -3494,9 +3752,15 @@ def watch_new_events(args: argparse.Namespace, original_argv: list[str]) -> int:
                 flush=True,
             )
 
-        # Do not forget an event just because it temporarily disappears from a
-        # later snapshot; a reappearance should not generate a false NEW alert.
-        known_event_tickers.update(current_events)
+        # Disappeared tickers stay in seen_entries so a reappearance is not NEW.
+        try:
+            _persist_seen()
+        except OSError as exc:
+            print(
+                color(f"watch seen-state write failed ({seen_path}): {exc}", "red", colors),
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3584,6 +3848,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=300.0,
         metavar="SECONDS",
         help="Refresh interval for --watch-new (default: 5 minutes; minimum: 30 seconds)",
+    )
+    parser.add_argument(
+        "--watch-seen-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "JSON set of parent event tickers already seen by --watch-new. Default: "
+            "$XDG_STATE_HOME/mention-scout/seen-event-tickers.json or "
+            "~/.local/state/mention-scout/seen-event-tickers.json"
+        ),
     )
     parser.add_argument(
         "--queue-initialized",
@@ -3914,6 +4189,8 @@ def main() -> int:
             raise SystemExit(f"email test failed: {exc}") from exc
     if args.email_new and not args.watch_new:
         raise SystemExit("--email-new is only valid together with --watch-new")
+    if args.watch_seen_file is not None and not args.watch_new:
+        raise SystemExit("--watch-seen-file is only valid together with --watch-new")
     if args.queue_initialized and not args.watch_new:
         raise SystemExit("--queue-initialized is only valid together with --watch-new")
     if args.calendar_add_new and not args.watch_new:
