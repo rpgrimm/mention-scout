@@ -22,7 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen as stdlib_urlopen
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 DEFAULT_JSON_PATH = Path.home() / ".config" / "mention-scout" / "calendar-added.json"
 KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 KNOWN_ACTIONS = ("google-news",)
@@ -432,7 +432,7 @@ def news_tabs_for_markets(
     for market in usable_markets(markets):
         ticker = str(market.get("ticker") or "").strip()
         word = market_word(market).strip()
-        if not word or word.casefold() == "unknown":
+        if not word or word.casefold() in {"unknown", "event does not qualify"}:
             continue
         query = google_query_for_word(word, mode=mode, guest=guest)
         if not query:
