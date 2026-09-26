@@ -22,7 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen as stdlib_urlopen
 
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 DEFAULT_JSON_PATH = Path.home() / ".config" / "mention-scout" / "calendar-added.json"
 KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 KNOWN_ACTIONS = ("google-news",)
@@ -415,12 +415,19 @@ def news_tabs_for_markets(
     mode: str,
     guest: str | None,
 ) -> list[NewsTab]:
-    """Build Google tabs for active/open market words, plus guest news in interview mode."""
+    """Build Google tabs for active/open market words, plus guest searches in interview mode."""
     tabs: list[NewsTab] = []
 
     if mode == "interview":
-        normalized_guest = re.sub(r"\\s+", " ", str(guest or "")).strip()
+        normalized_guest = re.sub(r"\s+", " ", str(guest or "")).strip()
         if normalized_guest:
+            tabs.append(
+                NewsTab(
+                    word=f"{normalized_guest} recent and relevant person biography",
+                    url=google_search_url(f"{normalized_guest} biography"),
+                    ticker="__guest_biography__",
+                )
+            )
             tabs.append(
                 NewsTab(
                     word=f"{normalized_guest} news",
@@ -441,13 +448,14 @@ def news_tabs_for_markets(
 
     tabs.sort(
         key=lambda tab: (
-            0 if tab.ticker == "__guest_news__" else 1,
+            0 if tab.ticker == "__guest_biography__"
+            else 1 if tab.ticker == "__guest_news__"
+            else 2,
             tab.word.casefold(),
             tab.ticker,
         )
     )
     return tabs
-
 
 def looks_headless(environ: Mapping[str, str]) -> bool:
     """True when neither DISPLAY nor WAYLAND_DISPLAY is set."""
