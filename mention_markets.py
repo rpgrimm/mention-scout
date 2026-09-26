@@ -22,7 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen as stdlib_urlopen
 
-VERSION = "1.1.0"
+VERSION = "1.1.2"
 DEFAULT_JSON_PATH = Path.home() / ".config" / "mention-scout" / "calendar-added.json"
 KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 KNOWN_ACTIONS = ("google-news",)
@@ -415,8 +415,20 @@ def news_tabs_for_markets(
     mode: str,
     guest: str | None,
 ) -> list[NewsTab]:
-    """Build one Google tab per unique active/open market ticker."""
+    """Build Google tabs for active/open market words, plus guest news in interview mode."""
     tabs: list[NewsTab] = []
+
+    if mode == "interview":
+        normalized_guest = re.sub(r"\\s+", " ", str(guest or "")).strip()
+        if normalized_guest:
+            tabs.append(
+                NewsTab(
+                    word=f"{normalized_guest} news",
+                    url=google_search_url(f"{normalized_guest} news"),
+                    ticker="__guest_news__",
+                )
+            )
+
     for market in usable_markets(markets):
         ticker = str(market.get("ticker") or "").strip()
         word = market_word(market).strip()
@@ -427,7 +439,13 @@ def news_tabs_for_markets(
             continue
         tabs.append(NewsTab(word=word, url=google_search_url(query), ticker=ticker))
 
-    tabs.sort(key=lambda tab: (tab.word.casefold(), tab.ticker))
+    tabs.sort(
+        key=lambda tab: (
+            0 if tab.ticker == "__guest_news__" else 1,
+            tab.word.casefold(),
+            tab.ticker,
+        )
+    )
     return tabs
 
 
