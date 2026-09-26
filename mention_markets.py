@@ -22,6 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen as stdlib_urlopen
 
+
 VERSION = "1.1.4"
 DEFAULT_JSON_PATH = Path.home() / ".config" / "mention-scout" / "calendar-added.json"
 KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
@@ -407,7 +408,6 @@ def usable_markets(markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         by_ticker[ticker] = market
     return list(by_ticker.values())
-
 
 def news_tabs_for_markets(
     markets: list[dict[str, Any]],
