@@ -11,6 +11,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import webbrowser
@@ -23,7 +25,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen as stdlib_urlopen
 
 
-VERSION = "1.1.4"
+VERSION = "1.2.0"
 DEFAULT_JSON_PATH = Path.home() / ".config" / "mention-scout" / "calendar-added.json"
 KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 KNOWN_ACTIONS = ("google-news",)
@@ -62,6 +64,14 @@ MODE_ALIASES = {
     "fns": "interview",
 }
 WORLD_NEWS_TICKER_PREFIX = "KXWORLDNEWSMENTION"
+KALSHI_EVENT_TAB_TICKER = "__kalshi_event__"
+CHROME_BINARIES = (
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium-browser",
+    "chromium",
+    "chrome",
+)
 
 urlopen = stdlib_urlopen
 Opener = Callable[[str], Any]
@@ -287,6 +297,77 @@ def google_search_url(query: str) -> str:
     return "https://www.google.com/search?" + urlencode({"q": query})
 
 
+def series_ticker_from_event_ticker(event_ticker: str) -> str:
+    """Parent series for ``SERIES-26OCT15`` event tickers."""
+    raw = ticker_from_key(event_ticker)
+    match = re.match(r"^(?P<series>.+)-(?P<date>\d{2}[A-Z]{3}\d{2})$", raw, re.IGNORECASE)
+    if match:
+        return match.group("series")
+    if "-" in raw:
+        return raw.rsplit("-", 1)[0]
+    return raw
+
+
+def slugify_for_kalshi_url(value: Any) -> str:
+    """SEO middle path for Kalshi public event pages."""
+    text = " ".join(str(value or "").split()).strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return text or "market"
+
+
+def event_title_from_markets(markets: list[dict[str, Any]]) -> str:
+    for market in markets:
+        title = str(market.get("title") or "").strip()
+        if title:
+            return title
+    return ""
+
+
+def kalshi_event_page_url(event_ticker: str, markets: list[dict[str, Any]]) -> str:
+    """Public kalshi.com event page for one parent mention event."""
+    ticker = ticker_from_key(event_ticker)
+    series = series_ticker_from_event_ticker(ticker)
+    slug = slugify_for_kalshi_url(event_title_from_markets(markets))
+    return (
+        "https://kalshi.com/markets/"
+        f"{series.lower()}/{slug}/{ticker.lower()}"
+    )
+
+
+def chrome_open_new_tab(url: str) -> bool:
+    """Open ``url`` in Google Chrome (new tab). Fall back to the default browser."""
+    if sys.platform == "darwin":
+        try:
+            subprocess.Popen(
+                ["open", "-a", "Google Chrome", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+        except OSError:
+            pass
+    for name in CHROME_BINARIES:
+        binary = shutil.which(name)
+        if not binary:
+            continue
+        try:
+            subprocess.Popen(
+                [binary, "--new-tab", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+        except OSError:
+            continue
+    try:
+        browser = webbrowser.get("google-chrome")
+        return bool(browser.open_new_tab(url))
+    except webbrowser.Error:
+        return bool(webbrowser.open_new_tab(url))
+
+
 def is_open_market(market: dict[str, Any]) -> bool:
     """Keep markets Kalshi reports as active or open."""
     status = str(market.get("status") or "").casefold()
@@ -414,9 +495,16 @@ def news_tabs_for_markets(
     *,
     mode: str,
     guest: str | None,
+    event_ticker: str,
 ) -> list[NewsTab]:
-    """Build Google tabs for active/open market words, plus guest searches in interview mode."""
-    tabs: list[NewsTab] = []
+    """Build Kalshi event tab plus Google tabs for active/open market words."""
+    tabs: list[NewsTab] = [
+        NewsTab(
+            word="kalshi.com",
+            url=kalshi_event_page_url(event_ticker, markets),
+            ticker=KALSHI_EVENT_TAB_TICKER,
+        )
+    ]
 
     if mode == "interview":
         normalized_guest = re.sub(r"\s+", " ", str(guest or "")).strip()
@@ -448,9 +536,10 @@ def news_tabs_for_markets(
 
     tabs.sort(
         key=lambda tab: (
-            0 if tab.ticker == "__guest_biography__"
-            else 1 if tab.ticker == "__guest_news__"
-            else 2,
+            0 if tab.ticker == KALSHI_EVENT_TAB_TICKER
+            else 1 if tab.ticker == "__guest_biography__"
+            else 2 if tab.ticker == "__guest_news__"
+            else 3,
             tab.word.casefold(),
             tab.ticker,
         )
@@ -543,8 +632,14 @@ def cmd_target(
     else:
         print(f"mode: interview ({resolved_guest})", file=sys.stderr)
 
-    tabs = news_tabs_for_markets(markets, mode=resolved_mode, guest=resolved_guest)
-    if not tabs:
+    tabs = news_tabs_for_markets(
+        markets,
+        mode=resolved_mode,
+        guest=resolved_guest,
+        event_ticker=event.ticker,
+    )
+    word_tabs = [tab for tab in tabs if tab.ticker != KALSHI_EVENT_TAB_TICKER]
+    if not word_tabs:
         print(
             f"No active/open mention markets with usable words for {event.ticker}",
             file=sys.stderr,
@@ -567,7 +662,7 @@ def cmd_target(
 
     open_news_tabs(
         tabs,
-        opener=opener or webbrowser.open_new_tab,
+        opener=opener or chrome_open_new_tab,
         sleep=sleep,
         sleep_fn=sleep_fn,
     )

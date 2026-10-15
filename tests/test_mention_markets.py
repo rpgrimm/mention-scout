@@ -199,6 +199,39 @@ def test_guest_from_title() -> None:
     )
 
 
+def test_kalshi_event_page_url_from_title() -> None:
+    assert mm.series_ticker_from_event_ticker("KXWORLDNEWSMENTION-26OCT15") == "KXWORLDNEWSMENTION"
+    url = mm.kalshi_event_page_url(
+        "KXWORLDNEWSMENTION-26OCT15",
+        [{
+            "title": (
+                "What will any host or reporter say during ABC World News Tonight "
+                "originally scheduled for October 15, 2026?"
+            )
+        }],
+    )
+    assert url.startswith("https://kalshi.com/markets/kxworldnewsmention/")
+    assert url.endswith("/kxworldnewsmention-26oct15")
+    assert "october-15-2026" in url
+
+
+def test_chrome_open_new_tab_uses_chrome_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_which(name: str) -> str | None:
+        return "/usr/bin/google-chrome" if name == "google-chrome" else None
+
+    def fake_popen(cmd: list[str], **kwargs: Any) -> None:
+        calls.append(cmd)
+        return None
+
+    monkeypatch.setattr(mm.shutil, "which", fake_which)
+    monkeypatch.setattr(mm.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(mm.sys, "platform", "linux")
+    assert mm.chrome_open_new_tab("https://kalshi.com/markets/example") is True
+    assert calls == [["/usr/bin/google-chrome", "--new-tab", "https://kalshi.com/markets/example"]]
+
+
 def test_interview_query_is_guest_plus_word_not_show() -> None:
     assert (
         mm.google_query_for_word(
@@ -224,6 +257,17 @@ def test_market_word_prefers_slash_subtitle() -> None:
     assert mm.market_word(market) == "OpenAI / Anthropic"
 
 
+WNT_TITLE = (
+    "What will any host or reporter say during ABC World News Tonight "
+    "originally scheduled for September 25, 2026?"
+)
+KALSHI_WNT_URL = (
+    "https://kalshi.com/markets/kxworldnewsmention/"
+    "what-will-any-host-or-reporter-say-during-abc-world-news-tonight-"
+    "originally-scheduled-for-september-25-2026/kxworldnewsmention-26sep25"
+)
+
+
 def _openai_pages() -> dict[str, dict[str, Any]]:
     return {
         "": {
@@ -231,12 +275,14 @@ def _openai_pages() -> dict[str, dict[str, Any]]:
                 {
                     "ticker": "KXWORLDNEWSMENTION-26SEP25-OPENAI",
                     "status": "active",
+                    "title": WNT_TITLE,
                     "yes_sub_title": "OpenAI / Anthropic",
                     "custom_strike": {"Word": "OpenAI"},
                 },
                 {
                     "ticker": "KXWORLDNEWSMENTION-26SEP25-STARBUCKS",
                     "status": "open",
+                    "title": WNT_TITLE,
                     "custom_strike": {"Word": "Starbucks"},
                 },
             ],
@@ -247,6 +293,7 @@ def _openai_pages() -> dict[str, dict[str, Any]]:
                 {
                     "ticker": "KXWORLDNEWSMENTION-26SEP25-IRAN",
                     "status": "active",
+                    "title": WNT_TITLE,
                     "yes_sub_title": "Iran (3+ times)",
                 }
             ],
@@ -282,13 +329,16 @@ def test_paginated_markets_open_one_tab_per_market(tmp_path: Path, capsys: pytes
     assert "cursor=page2" in fake_http.calls[1]
     out_lines = capsys.readouterr().out.splitlines()
     words = [line.split("\t", 1)[0] for line in out_lines]
-    assert words == ["Iran (3+ times)", "OpenAI / Anthropic", "Starbucks"]
+    assert words[0] == "kalshi.com"
+    assert out_lines[0].split("\t", 1)[1] == KALSHI_WNT_URL
+    assert words[1:] == ["Iran (3+ times)", "OpenAI / Anthropic", "Starbucks"]
     assert any("q=OpenAI+Anthropic+news" in line or "q=OpenAI%20Anthropic%20news" in line for line in out_lines)
     assert any("q=Starbucks+news" in line or "q=Starbucks%20news" in line for line in out_lines)
     assert any("q=Iran+news" in line or "q=Iran%20news" in line for line in out_lines)
-    assert len(opener.urls) == 3
+    assert len(opener.urls) == 4
+    assert opener.urls[0] == KALSHI_WNT_URL
     assert opener.urls == [line.split("\t", 1)[1] for line in out_lines]
-    assert sleeps == [0.15, 0.15]
+    assert sleeps == [0.15, 0.15, 0.15]
 
 
 def test_default_sleep_is_two_seconds(tmp_path: Path) -> None:
@@ -304,8 +354,9 @@ def test_default_sleep_is_two_seconds(tmp_path: Path) -> None:
     )
     assert code == 0
     assert mm.DEFAULT_SLEEP == 2.0
-    assert sleeps == [2.0, 2.0]
-    assert len(opener.urls) == 3
+    assert sleeps == [2.0, 2.0, 2.0]
+    assert len(opener.urls) == 4
+    assert opener.urls[0].startswith("https://kalshi.com/markets/")
 
 
 def test_dry_run_never_calls_opener(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -328,7 +379,9 @@ def test_dry_run_never_calls_opener(tmp_path: Path, capsys: pytest.CaptureFixtur
     captured = capsys.readouterr()
     assert opener.urls == []
     assert "OpenAI / Anthropic" in captured.out
-    assert "dry-run: 3 tabs" in captured.err
+    assert "kalshi.com" in captured.out
+    assert KALSHI_WNT_URL in captured.out
+    assert "dry-run: 4 tabs" in captured.err
     assert "headless" not in captured.err
     assert "mode: world-news" in captured.err
 
@@ -376,10 +429,17 @@ def test_interview_auto_mode_uses_guest_and_not_show(
     assert "q=Jamie+Raskin+OpenAI+Anthropic" in captured.out or "q=Jamie%20Raskin%20OpenAI%20Anthropic" in captured.out
     assert "Meet+the+Press" not in captured.out
     assert "Meet%20the%20Press" not in captured.out
+    assert "kalshi.com" in captured.out
+    assert "https://kalshi.com/markets/kxmtpmention/" in captured.out
     for line in captured.out.splitlines():
+        _word, url = line.split("\t", 1)
+        if "kalshi.com" in url:
+            continue
         assert "Meet the Press" not in line
-        _, url = line.split("\t", 1)
-        assert "news" not in url.lower().split("q=", 1)[-1]
+        query = url.lower().split("q=", 1)[-1] if "q=" in url else ""
+        if "biography" in url.lower() or query.endswith("news") or "+news" in query:
+            continue
+        assert "news" not in query
 
 
 def test_mode_override_world_news_on_interview_ticker(
@@ -483,7 +543,8 @@ def test_inactive_unopened_markets_are_not_opened(
     assert "ClosedWord" not in out
     assert "SoonWord" not in out
     assert "InactiveWord" not in out
-    assert len(opener.urls) == 1
+    assert len(opener.urls) == 2
+    assert opener.urls[0].startswith("https://kalshi.com/markets/")
 
 
 def test_empty_open_markets_exits_1_without_opening(
