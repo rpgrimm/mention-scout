@@ -9,8 +9,9 @@ Ships on `openclaw/ms-0020` / PR #30 (same checkout as SMTP2GO setup). Do not me
 
 - One-shot: `./mention_scout.py --test-calendar`
 - Inserts a dummy timed event on **today's date at 12:00** in `--timezone` (default America/New_York), duration 15 minutes.
-- GET confirms the event id exists.
-- DELETE the dummy event (do not leave it on the calendar; do not write `calendar-added.json`).
+- GET confirms the event id exists (API).
+- Wait for the owner to press Enter after they see it on Google Calendar (Ctrl-C leaves it). `--yes` skips the wait.
+- DELETE the dummy event (do not write `calendar-added.json`).
 - GET after delete must look like 404/410.
 - If GET-after-insert fails, still attempt delete.
 - Requires OAuth token (`--calendar-auth` first). Does not require calendar-matches.json.

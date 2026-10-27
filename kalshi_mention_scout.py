@@ -47,7 +47,7 @@ Changes in v16.5 / MS-0020:
     keep working. ``smtp2go`` uses ``mail.smtp2go.com:2525`` and
     ``~/.config/mention-scout/smtp``. ``--test-email`` sends one message and exits.
   * ``--test-calendar`` inserts a dummy timed event at today 12:00 in ``--timezone``,
-    GETs it to confirm, then deletes it.
+    waits for you to confirm it in Google Calendar, then deletes it. ``--yes`` skips the wait.
 
 Changes in v16.4 / MS-0018:
   * --watch-new persists seen parent event tickers under
@@ -1591,6 +1591,7 @@ def _watch_child_arguments(original_argv: list[str]) -> list[str]:
         "--queue-initialized",
         "--test-email",
         "--test-calendar",
+        "--yes",
         "--calendar-add-new",
         "--calendar-auth",
         "--audit-calendar-matches",
@@ -3382,8 +3383,10 @@ def send_test_calendar(
     *,
     calendar_client: CalendarClient | None = None,
     now: datetime | None = None,
+    wait_confirm: bool | None = None,
+    confirm_fn: Any | None = None,
 ) -> int:
-    """Insert a dummy noon event, confirm it exists, delete it, then exit."""
+    """Insert a dummy noon event, wait for owner confirm, delete it, then exit."""
     try:
         local_tz = ZoneInfo(args.timezone)
     except Exception as exc:
@@ -3409,7 +3412,7 @@ def send_test_calendar(
         + (f" {html_link}" if html_link else ""),
         flush=True,
     )
-    delete_error: BaseException | None = None
+    get_error: BaseException | None = None
     try:
         fetched = calendar_client.get_event(calendar_id, event_id)
         fetched_id = str(fetched.get("id") or "").strip()
@@ -3417,17 +3420,47 @@ def send_test_calendar(
             raise RuntimeError(
                 f"calendar get returned a different event id ({fetched_id!r} != {event_id!r})"
             )
-        print("calendar test confirmed event exists", flush=True)
-    finally:
+        print("calendar test API confirms event exists", flush=True)
+    except RuntimeError as exc:
+        get_error = exc
+        print(f"calendar test API get failed: {exc}", flush=True)
+
+    should_wait = (not bool(getattr(args, "yes", False))) if wait_confirm is None else wait_confirm
+    if should_wait:
+        print(f"Look in Google Calendar for: {TEST_CALENDAR_SUMMARY}", flush=True)
+        print(f"  when: {start_label}", flush=True)
+        if html_link:
+            print(f"  link: {html_link}", flush=True)
+        print(
+            "Press Enter when you see it (Ctrl-C leaves the event on the calendar).",
+            flush=True,
+        )
+        try:
+            waiter = confirm_fn if confirm_fn is not None else input
+            waiter()
+        except EOFError as exc:
+            raise SystemExit(
+                f"no TTY to wait for confirm; re-run with --yes or interactively. "
+                f"left dummy event: {html_link or event_id}"
+            ) from exc
+        except KeyboardInterrupt as exc:
+            raise SystemExit(
+                f"left dummy event on the calendar: {html_link or event_id}"
+            ) from exc
+    elif get_error is not None:
         try:
             calendar_client.delete_event(calendar_id, event_id)
-        except Exception as exc:  # noqa: BLE001 - always try to clean up
-            delete_error = exc
-    if delete_error is not None:
+        except Exception:
+            pass
+        raise get_error
+
+    try:
+        calendar_client.delete_event(calendar_id, event_id)
+    except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
-            f"inserted and confirmed {html_link or event_id} but delete failed: {delete_error}. "
+            f"inserted {html_link or event_id} but delete failed: {exc}. "
             "Delete the dummy event in Google Calendar."
-        ) from delete_error
+        ) from exc
     try:
         calendar_client.get_event(calendar_id, event_id)
     except RuntimeError as exc:
@@ -4238,7 +4271,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--test-calendar",
         action="store_true",
-        help="Insert a dummy Google Calendar event at today 12:00, confirm it exists, delete it, then exit",
+        help="Insert a dummy Google Calendar event at today 12:00, wait until you confirm you see it, then delete it",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="With --test-calendar, delete after API confirm without waiting for Enter",
     )
     parser.add_argument(
         "--email-config",
@@ -4485,6 +4523,8 @@ def main() -> int:
         )
     if dry_run_set and not add_mode:
         raise SystemExit("--dry-run is only valid together with --add-calendar-match")
+    if bool(getattr(args, "yes", False)) and not args.test_calendar:
+        raise SystemExit("--yes is only valid together with --test-calendar")
     if email_on_fail_explicit and not audit_mode:
         raise SystemExit(
             "--email-on-fail/--no-email-on-fail are only valid together with "

@@ -74,13 +74,15 @@ def test_send_test_calendar_inserts_confirms_and_deletes(capsys: pytest.CaptureF
         calendar_token=Path("/tmp/unused-token.json"),
     )
     now = datetime(2026, 10, 27, 9, 0, tzinfo=NY)
-    assert scout.send_test_calendar(args, calendar_client=client, now=now) == 0
+    assert scout.send_test_calendar(
+        args, calendar_client=client, now=now, wait_confirm=False
+    ) == 0
     assert client.deleted == ["test-1"]
     assert client.events == {}
     out = capsys.readouterr().out
     assert "calendar test inserted test-1" in out
     assert "2026-10-27T12:00:00" in out
-    assert "calendar test confirmed event exists" in out
+    assert "calendar test API confirms event exists" in out
     assert "calendar test deleted dummy event" in out
 
 
@@ -94,7 +96,9 @@ def test_send_test_calendar_deletes_even_if_get_fails() -> None:
     client = FlakyGet()
     args = Namespace(timezone="America/New_York", calendar_id="primary")
     with pytest.raises(RuntimeError, match="500 boom"):
-        scout.send_test_calendar(args, calendar_client=client, now=datetime(2026, 10, 27, tzinfo=NY))
+        scout.send_test_calendar(
+            args, calendar_client=client, now=datetime(2026, 10, 27, tzinfo=NY), wait_confirm=False
+        )
     assert client.deleted == ["test-1"]
     assert client.events == {}
 
@@ -107,7 +111,9 @@ def test_send_test_calendar_reports_delete_failure() -> None:
     client = NoDelete()
     args = Namespace(timezone="America/New_York", calendar_id="primary")
     with pytest.raises(RuntimeError, match="delete failed"):
-        scout.send_test_calendar(args, calendar_client=client, now=datetime(2026, 10, 27, tzinfo=NY))
+        scout.send_test_calendar(
+            args, calendar_client=client, now=datetime(2026, 10, 27, tzinfo=NY), wait_confirm=False
+        )
     assert "test-1" in client.events
 
 
@@ -121,3 +127,24 @@ def test_parser_has_test_calendar() -> None:
     args = scout.build_parser().parse_args(["--test-calendar"])
     assert args.test_calendar is True
     assert args.test_email is False
+    assert args.yes is False
+
+
+def test_send_test_calendar_waits_before_delete() -> None:
+    client = MemoryCalendarClient()
+    seen_before_delete: list[bool] = []
+
+    def confirm() -> None:
+        seen_before_delete.append("test-1" in client.events)
+        assert client.deleted == []
+
+    args = Namespace(timezone="America/New_York", calendar_id="primary", yes=False)
+    assert scout.send_test_calendar(
+        args,
+        calendar_client=client,
+        now=datetime(2026, 10, 27, tzinfo=NY),
+        wait_confirm=True,
+        confirm_fn=confirm,
+    ) == 0
+    assert seen_before_delete == [True]
+    assert client.deleted == ["test-1"]

@@ -229,13 +229,13 @@ python3 -m pip install -e '.[calendar]'
 
 This writes `~/.config/mention-scout/token.json` (mode `600`). Headless `--watch-new --calendar-add-new` **never** opens a browser; missing/invalid secret, token, or match file fails fast at watch start.
 
-Prove Calendar insert/delete (dummy event at **today 12:00** in `--timezone`, then removed):
+Prove Calendar insert/delete (dummy event at **today 12:00** in `--timezone`):
 
 ```bash
 ./mention_scout.py --test-calendar
 ```
 
-Does not write `calendar-added.json`. Needs `client_secret.json` + `token.json` (run `--calendar-auth` first). Success prints insert, confirm, and delete.
+Inserts, prints the event link, then **waits for Enter** after you see it on Google Calendar, then deletes it. Ctrl-C leaves the dummy event. `--yes` skips the wait (API confirm + delete). Does not write `calendar-added.json`. Needs `client_secret.json` + `token.json`.
 
 ### 3. Run watch with calendar
 
