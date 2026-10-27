@@ -121,6 +121,58 @@ def test_calendar_error_is_missing() -> None:
     assert scout.calendar_error_is_missing(RuntimeError("HttpError 404 when requesting"))
     assert scout.calendar_error_is_missing(RuntimeError("410 Gone"))
     assert not scout.calendar_error_is_missing(RuntimeError("500 backendError"))
+    assert scout.calendar_event_is_deleted({"id": "x", "status": "cancelled"})
+    assert not scout.calendar_event_is_deleted({"id": "x", "status": "confirmed"})
+
+
+def test_send_test_calendar_treats_cancelled_get_as_deleted() -> None:
+    class CancelledAfterDelete(MemoryCalendarClient):
+        def delete_event(self, calendar_id: str, event_id: str) -> None:
+            self.deleted.append(event_id)
+            self.events[event_id]["status"] = "cancelled"
+
+        def get_event(self, calendar_id: str, event_id: str) -> dict:
+            payload = self.events[event_id]
+            return {"id": event_id, "status": payload.get("status", "confirmed")}
+
+    client = CancelledAfterDelete()
+    args = Namespace(timezone="America/New_York", calendar_id="primary")
+    assert scout.send_test_calendar(
+        args, calendar_client=client, now=datetime(2026, 10, 27, tzinfo=NY), wait_confirm=False
+    ) == 0
+    assert client.deleted == ["test-1"]
+
+
+def test_send_test_calendar_retries_get_after_delete() -> None:
+    sleeps: list[float] = []
+
+    class LaggedDelete(MemoryCalendarClient):
+        def delete_event(self, calendar_id: str, event_id: str) -> None:
+            self.deleted.append(event_id)
+            self.events[event_id]["gets_after_delete"] = 0
+
+        def get_event(self, calendar_id: str, event_id: str) -> dict:
+            payload = self.events[event_id]
+            if event_id in self.deleted:
+                payload["gets_after_delete"] = int(payload.get("gets_after_delete") or 0) + 1
+                if payload["gets_after_delete"] >= 2:
+                    return {"id": event_id, "status": "cancelled"}
+                return {"id": event_id, "status": "confirmed"}
+            return {"id": event_id, "htmlLink": payload["htmlLink"]}
+
+    client = LaggedDelete()
+    args = Namespace(timezone="America/New_York", calendar_id="primary")
+    assert scout.send_test_calendar(
+        args,
+        calendar_client=client,
+        now=datetime(2026, 10, 27, tzinfo=NY),
+        wait_confirm=False,
+        sleep_fn=sleeps.append,
+        delete_retries=5,
+        delete_retry_seconds=1.0,
+    ) == 0
+    assert sleeps == [1.0]
+    assert client.deleted == ["test-1"]
 
 
 def test_parser_has_test_calendar() -> None:

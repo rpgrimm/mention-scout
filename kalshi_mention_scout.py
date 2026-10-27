@@ -3353,6 +3353,12 @@ def calendar_error_is_missing(error: BaseException) -> bool:
     return False
 
 
+def calendar_event_is_deleted(payload: dict[str, Any]) -> bool:
+    """Google Calendar delete often leaves a GET-able event with status cancelled."""
+    status = str(payload.get("status") or "").strip().casefold()
+    return status in {"cancelled", "canceled"}
+
+
 def build_test_calendar_event_body(now: datetime, local_tz: ZoneInfo) -> dict[str, Any]:
     """Dummy timed event: today's date at 12:00 in ``local_tz``, 15 minutes."""
     local_now = now.astimezone(local_tz)
@@ -3385,6 +3391,9 @@ def send_test_calendar(
     now: datetime | None = None,
     wait_confirm: bool | None = None,
     confirm_fn: Any | None = None,
+    sleep_fn: Any | None = None,
+    delete_retries: int = 5,
+    delete_retry_seconds: float = 1.0,
 ) -> int:
     """Insert a dummy noon event, wait for owner confirm, delete it, then exit."""
     try:
@@ -3461,17 +3470,27 @@ def send_test_calendar(
             f"inserted {html_link or event_id} but delete failed: {exc}. "
             "Delete the dummy event in Google Calendar."
         ) from exc
-    try:
-        calendar_client.get_event(calendar_id, event_id)
-    except RuntimeError as exc:
-        if not calendar_error_is_missing(exc):
+    sleeper = time.sleep if sleep_fn is None else sleep_fn
+    attempts = max(1, int(delete_retries))
+    delay = max(0.0, float(delete_retry_seconds))
+    last_status = ""
+    for attempt in range(attempts):
+        try:
+            fetched = calendar_client.get_event(calendar_id, event_id)
+        except RuntimeError as exc:
+            if calendar_error_is_missing(exc):
+                print("calendar test deleted dummy event", flush=True)
+                return 0
             raise
-    else:
-        raise RuntimeError(
-            f"delete reported success but event still exists: {html_link or event_id}"
-        )
-    print("calendar test deleted dummy event", flush=True)
-    return 0
+        if calendar_event_is_deleted(fetched):
+            print("calendar test deleted dummy event", flush=True)
+            return 0
+        last_status = str(fetched.get("status") or "confirmed")
+        if attempt + 1 < attempts and delay:
+            sleeper(delay)
+    raise RuntimeError(
+        f"delete reported success but event still exists ({last_status}): {html_link or event_id}"
+    )
 
 
 def verify_calendar_configuration(args: argparse.Namespace) -> tuple[CalendarMatchCache, Any, dict[str, Any]]:
