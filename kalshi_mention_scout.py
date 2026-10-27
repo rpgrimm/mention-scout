@@ -2000,7 +2000,7 @@ def run_swaks_email(
     password: str,
     subject: str,
     body: str,
-) -> None:
+) -> str:
     """Send one plain-text SMTP message using the user's swaks setup."""
     command = [
         "swaks",
@@ -2021,9 +2021,11 @@ def run_swaks_email(
     except OSError as exc:
         raise RuntimeError(f"could not start swaks: {exc}") from exc
 
+    output = f"{completed.stdout or ''}{completed.stderr or ''}"
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or f"exit {completed.returncode}").strip()
+        detail = output.strip() or f"exit {completed.returncode}"
         raise RuntimeError(format_swaks_failure(detail, sender=sender))
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -3583,7 +3585,15 @@ def send_test_email(args: argparse.Namespace) -> int:
             "This confirms --email-new SMTP via ~/.config/mention-scout/email.json and swaks."
         ),
     )
-    print(f"test email sent to {args.email_to}", flush=True)
+    print(
+        f"test email sent to {args.email_to} from {args.email_from} via {args.smtp_server}",
+        flush=True,
+    )
+    print(
+        'Search Gmail for: from:ryangrimm.net subject:"mention scout SMTP test" '
+        "(also Spam / Promotions). SMTP2GO Activity shows if Gmail accepted or bounced it.",
+        flush=True,
+    )
     return 0
 
 
