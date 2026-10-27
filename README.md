@@ -105,7 +105,7 @@ Install [swaks](https://www.jetmore.org/john/code/swaks/) on `PATH`, then prove 
 ./mention_scout.py --test-email --email-to you@example.com --email-from you@example.com
 ```
 
-`--email-provider google|smtp2go` overrides the JSON. Credentials are sourced, never printed. SMTP2GO requires `--email-from` to be a **Verified Sender** (domain or single email in the SMTP2GO dashboard); `ryan.grimm@gmail.com` only works if that exact address is verified.
+`--email-provider google|smtp2go` overrides the JSON. Credentials are sourced, never printed. SMTP2GO `--email-from` defaults to `ryan@ryangrimm.net` (verified domain). Override with `"from"` in `email.json` or `--email-from`. `--email-to` can stay Gmail.
 
 ## Google Calendar auto-add (optional)
 

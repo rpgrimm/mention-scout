@@ -38,7 +38,7 @@ def _args(tmp_path: Path, **kwargs: object) -> Namespace:
         smtp_auth_user="",
         smtp_server="",
         email_to="ryan.grimm@gmail.com",
-        email_from="ryan.grimm@gmail.com",
+        email_from="",
         timezone="America/New_York",
     )
     defaults.update(kwargs)
@@ -93,14 +93,27 @@ def test_apply_no_config_uses_gmail_server(tmp_path: Path) -> None:
     profile = scout.apply_email_provider(args)
     assert profile.id == "google"
     assert args.smtp_server == "smtp.gmail.com:587"
+    assert args.email_from == "ryan.grimm@gmail.com"
 
 
-def test_apply_smtp2go_config_uses_smtp2go_server(tmp_path: Path) -> None:
+def test_apply_smtp2go_config_uses_smtp2go_server_and_ryangrimm_from(tmp_path: Path) -> None:
     config = _write_provider(tmp_path / "email.json", "smtp2go")
     args = _args(tmp_path, email_config=config)
     profile = scout.apply_email_provider(args)
     assert profile.id == "smtp2go"
     assert args.smtp_server == "mail.smtp2go.com:2525"
+    assert args.email_from == "ryan@ryangrimm.net"
+
+
+def test_email_json_from_overrides_smtp2go_default(tmp_path: Path) -> None:
+    path = tmp_path / "email.json"
+    path.write_text(
+        json.dumps({"provider": "smtp2go", "from": "alerts@ryangrimm.net"}) + "\n",
+        encoding="utf-8",
+    )
+    args = _args(tmp_path, email_config=path)
+    scout.apply_email_provider(args)
+    assert args.email_from == "alerts@ryangrimm.net"
 
 
 def test_cli_email_provider_overrides_json(tmp_path: Path) -> None:

@@ -160,6 +160,8 @@ DEFAULT_SMTP_CREDENTIALS_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "smtp"
 DEFAULT_GMAIL_SMTP_SERVER = "smtp.gmail.com:587"
 DEFAULT_SMTP2GO_SERVER = "mail.smtp2go.com:2525"
 DEFAULT_GMAIL_AUTH_USER = "ryan.grimm@gmail.com"
+DEFAULT_GMAIL_FROM = "ryan.grimm@gmail.com"
+DEFAULT_SMTP2GO_FROM = "ryan@ryangrimm.net"
 DEFAULT_EMAIL_PROVIDER = "google"
 DEFAULT_CALENDAR_MATCHES_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "calendar-matches.json"
 DEFAULT_CALENDAR_CLIENT_SECRET_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "client_secret.json"
@@ -1810,11 +1812,20 @@ def normalize_email_provider(value: Any) -> str:
     return provider
 
 
-def load_email_provider_config(path: Path) -> str:
-    """Read provider from email.json. Missing file defaults to google."""
+@dataclass(frozen=True)
+class EmailFileConfig:
+    """Owner email.json: provider plus optional from/to overrides."""
+
+    provider: str
+    from_addr: str = ""
+    to_addr: str = ""
+
+
+def load_email_file_config(path: Path) -> EmailFileConfig:
+    """Read ~/.config/mention-scout/email.json. Missing file defaults to google."""
     config_path = path.expanduser()
     if not config_path.exists():
-        return DEFAULT_EMAIL_PROVIDER
+        return EmailFileConfig(provider=DEFAULT_EMAIL_PROVIDER)
     try:
         payload = json.loads(config_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -1825,21 +1836,39 @@ def load_email_provider_config(path: Path) -> str:
         raise RuntimeError(f"cannot read email config {config_path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise RuntimeError(f"email config must be a JSON object: {config_path}")
-    return normalize_email_provider(payload.get("provider"))
+    from_addr = str(payload.get("from") or payload.get("email_from") or "").strip()
+    to_addr = str(payload.get("to") or payload.get("email_to") or "").strip()
+    return EmailFileConfig(
+        provider=normalize_email_provider(payload.get("provider")),
+        from_addr=from_addr,
+        to_addr=to_addr,
+    )
+
+
+def load_email_provider_config(path: Path) -> str:
+    """Read provider from email.json. Missing file defaults to google."""
+    return load_email_file_config(path).provider
 
 
 def apply_email_provider(args: argparse.Namespace) -> EmailProvider:
-    """Resolve google vs smtp2go and fill blank SMTP host from the profile."""
+    """Resolve google vs smtp2go and fill blank SMTP host/from from the profile."""
+    config_path = Path(getattr(args, "email_config", DEFAULT_EMAIL_CONFIG_FILE))
+    file_cfg = load_email_file_config(config_path)
     explicit = str(getattr(args, "email_provider", "") or "").strip()
-    if explicit:
-        provider_id = normalize_email_provider(explicit)
-    else:
-        config_path = Path(getattr(args, "email_config", DEFAULT_EMAIL_CONFIG_FILE))
-        provider_id = load_email_provider_config(config_path)
+    provider_id = normalize_email_provider(explicit) if explicit else file_cfg.provider
     profile = EMAIL_PROVIDERS[provider_id]
     args._email_provider = provider_id
     if not str(getattr(args, "smtp_server", "") or "").strip():
         args.smtp_server = profile.smtp_server
+    if not str(getattr(args, "email_from", "") or "").strip():
+        if file_cfg.from_addr:
+            args.email_from = file_cfg.from_addr
+        elif provider_id == "smtp2go":
+            args.email_from = DEFAULT_SMTP2GO_FROM
+        else:
+            args.email_from = DEFAULT_GMAIL_FROM
+    if file_cfg.to_addr and not str(getattr(args, "email_to", "") or "").strip():
+        args.email_to = file_cfg.to_addr
     return profile
 
 
@@ -4091,8 +4120,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--email-from",
-        default="ryan.grimm@gmail.com",
-        help="Envelope/header sender used by --email-new",
+        default="",
+        help="Envelope/header sender; default from email.json from, else ryan@ryangrimm.net (smtp2go) or ryan.grimm@gmail.com (google)",
     )
     parser.add_argument(
         "--smtp-server",
