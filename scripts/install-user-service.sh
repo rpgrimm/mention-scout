@@ -232,13 +232,11 @@ XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 UNIT_DIR="${XDG_CONFIG_HOME}/systemd/user"
 UNIT_PATH="${UNIT_DIR}/${UNIT_NAME}"
 
+EMAIL_CONFIG_FILE="${HOME}/.config/mention-scout/email.json"
 SMTP_FILE="${HOME}/.config/mention-scout/smtp"
 GOOGLE_PASSWORD_FILE="${HOME}/.config/.google-password"
-if [[ -f "$SMTP_FILE" ]]; then
-  PASSWORD_FILE="$SMTP_FILE"
-elif [[ -f "$GOOGLE_PASSWORD_FILE" ]]; then
-  PASSWORD_FILE="$GOOGLE_PASSWORD_FILE"
-else
+PASSWORD_FILE="$GOOGLE_PASSWORD_FILE"
+if [[ -f "$EMAIL_CONFIG_FILE" ]] && grep -qi 'smtp2go' "$EMAIL_CONFIG_FILE"; then
   PASSWORD_FILE="$SMTP_FILE"
 fi
 

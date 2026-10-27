@@ -1,13 +1,13 @@
-"""Offline tests for MS-0020 SMTP2GO credentials (~/.config/mention-scout/smtp)."""
+"""Offline tests for MS-0020 email provider + SMTP2GO credentials."""
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import sys
 from argparse import Namespace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -24,24 +24,53 @@ def _write_creds(path: Path, body: str, mode: int = 0o600) -> Path:
     return path
 
 
+def _write_provider(path: Path, provider: str) -> Path:
+    path.write_text(json.dumps({"provider": provider}) + "\n", encoding="utf-8")
+    return path
+
+
+def _args(tmp_path: Path, **kwargs: object) -> Namespace:
+    defaults = dict(
+        email_config=tmp_path / "missing-email.json",
+        email_provider="",
+        smtp_credentials=tmp_path / "smtp",
+        google_password_file=tmp_path / "missing-google",
+        smtp_auth_user="",
+        smtp_server="",
+        email_to="ryan.grimm@gmail.com",
+        email_from="ryan.grimm@gmail.com",
+        timezone="America/New_York",
+    )
+    defaults.update(kwargs)
+    return Namespace(**defaults)
+
+
 def test_load_smtp_credentials_username_and_password(tmp_path: Path) -> None:
     path = _write_creds(
         tmp_path / "smtp",
         "SMTP_USERNAME='smtp2go-user'\nSMTP_PASSWORD='smtp2go-secret'\n",
     )
-    creds = scout.load_smtp_credentials(path)
+    creds = scout.load_smtp_credentials(path, provider="smtp2go")
     assert creds.username == "smtp2go-user"
     assert creds.password == "smtp2go-secret"
 
 
 def test_load_smtp_credentials_accepts_google_password_alias(tmp_path: Path) -> None:
-    path = _write_creds(
-        tmp_path / ".google-password",
-        "GOOGLE_PASSWORD='gmail-app-pass'\n",
-    )
-    creds = scout.load_smtp_credentials(path)
+    path = _write_creds(tmp_path / ".google-password", "GOOGLE_PASSWORD='gmail-app-pass'\n")
+    creds = scout.load_smtp_credentials(path, provider="google")
     assert creds.username == ""
     assert creds.password == "gmail-app-pass"
+
+
+def test_google_missing_file_keeps_old_error(tmp_path: Path) -> None:
+    missing = tmp_path / ".google-password"
+    with pytest.raises(RuntimeError, match="Google password file is missing"):
+        scout.load_smtp_credentials(missing, provider="google")
+
+
+def test_smtp2go_missing_file_mentions_smtp_credentials(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="SMTP credentials file is missing"):
+        scout.load_smtp_credentials(tmp_path / "smtp", provider="smtp2go")
 
 
 def test_load_smtp_credentials_rejects_broad_permissions(tmp_path: Path) -> None:
@@ -50,24 +79,59 @@ def test_load_smtp_credentials_rejects_broad_permissions(tmp_path: Path) -> None
         scout.load_smtp_credentials(path)
 
 
-def test_load_smtp_credentials_missing_file(tmp_path: Path) -> None:
-    with pytest.raises(RuntimeError, match="missing"):
-        scout.load_smtp_credentials(tmp_path / "nope")
+def test_missing_email_config_defaults_to_google(tmp_path: Path) -> None:
+    assert scout.load_email_provider_config(tmp_path / "nope.json") == "google"
 
 
-def test_verify_fills_username_from_file(tmp_path: Path) -> None:
+def test_email_config_selects_smtp2go(tmp_path: Path) -> None:
+    path = _write_provider(tmp_path / "email.json", "smtp2go")
+    assert scout.load_email_provider_config(path) == "smtp2go"
+
+
+def test_apply_no_config_uses_gmail_server(tmp_path: Path) -> None:
+    args = _args(tmp_path)
+    profile = scout.apply_email_provider(args)
+    assert profile.id == "google"
+    assert args.smtp_server == "smtp.gmail.com:587"
+
+
+def test_apply_smtp2go_config_uses_smtp2go_server(tmp_path: Path) -> None:
+    config = _write_provider(tmp_path / "email.json", "smtp2go")
+    args = _args(tmp_path, email_config=config)
+    profile = scout.apply_email_provider(args)
+    assert profile.id == "smtp2go"
+    assert args.smtp_server == "mail.smtp2go.com:2525"
+
+
+def test_cli_email_provider_overrides_json(tmp_path: Path) -> None:
+    config = _write_provider(tmp_path / "email.json", "google")
+    args = _args(tmp_path, email_config=config, email_provider="smtp2go")
+    assert scout.apply_email_provider(args).id == "smtp2go"
+
+
+def test_verify_smtp2go_fills_username_from_file(tmp_path: Path) -> None:
     path = _write_creds(
         tmp_path / "smtp",
         "SMTP_USERNAME='from-file'\nSMTP_PASSWORD='pw'\n",
     )
-    args = Namespace(
+    args = _args(
+        tmp_path,
+        email_provider="smtp2go",
         smtp_credentials=path,
-        google_password_file=tmp_path / "missing-google",
-        smtp_auth_user="",
     )
     password = scout.verify_email_configuration(args)
     assert password == "pw"
     assert args.smtp_auth_user == "from-file"
+    assert args.smtp_server == "mail.smtp2go.com:2525"
+
+
+def test_verify_google_uses_default_auth_user(tmp_path: Path) -> None:
+    google = _write_creds(tmp_path / "google", "GOOGLE_PASSWORD='gmail-app-pass'\n")
+    args = _args(tmp_path, email_provider="google", google_password_file=google)
+    password = scout.verify_email_configuration(args)
+    assert password == "gmail-app-pass"
+    assert args.smtp_auth_user == "ryan.grimm@gmail.com"
+    assert args.smtp_server == "smtp.gmail.com:587"
 
 
 def test_verify_cli_username_overrides_file(tmp_path: Path) -> None:
@@ -75,41 +139,26 @@ def test_verify_cli_username_overrides_file(tmp_path: Path) -> None:
         tmp_path / "smtp",
         "SMTP_USERNAME='from-file'\nSMTP_PASSWORD='pw'\n",
     )
-    args = Namespace(
+    args = _args(
+        tmp_path,
+        email_provider="smtp2go",
         smtp_credentials=path,
-        google_password_file=tmp_path / "missing-google",
         smtp_auth_user="cli-user",
     )
     scout.verify_email_configuration(args)
     assert args.smtp_auth_user == "cli-user"
 
 
-def test_resolve_prefers_smtp_file_over_google(tmp_path: Path) -> None:
-    smtp = _write_creds(tmp_path / "smtp", "SMTP_PASSWORD='a'\nSMTP_USERNAME='u'\n")
-    google = _write_creds(tmp_path / "google", "GOOGLE_PASSWORD='b'\n")
-    args = SimpleNamespace(smtp_credentials=smtp, google_password_file=google)
-    assert scout.resolve_smtp_credentials_path(args) == smtp
-
-
-def test_resolve_falls_back_to_google_password(tmp_path: Path) -> None:
-    google = _write_creds(tmp_path / "google", "GOOGLE_PASSWORD='b'\n")
-    args = SimpleNamespace(
-        smtp_credentials=tmp_path / "missing-smtp",
-        google_password_file=google,
-    )
-    assert scout.resolve_smtp_credentials_path(args) == google
-
-
-def test_parser_defaults_smtp2go() -> None:
+def test_parser_defaults_do_not_force_smtp2go() -> None:
     parser = scout.build_parser()
     args = parser.parse_args(["--test-email"])
-    assert args.smtp_server == "mail.smtp2go.com:2525"
-    assert args.smtp_credentials == scout.DEFAULT_SMTP_CREDENTIALS_FILE
-    assert args.smtp_auth_user == ""
+    assert args.smtp_server == ""
+    assert args.email_provider == ""
+    assert args.email_config == scout.DEFAULT_EMAIL_CONFIG_FILE
     assert args.test_email is True
 
 
-def test_test_email_uses_loaded_username(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_test_email_smtp2go(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = _write_creds(
         tmp_path / "smtp",
         "SMTP_USERNAME='smtp2go-user'\nSMTP_PASSWORD='smtp2go-secret'\n",
@@ -120,15 +169,7 @@ def test_test_email_uses_loaded_username(tmp_path: Path, monkeypatch: pytest.Mon
         sent.update(kwargs)
 
     monkeypatch.setattr(scout, "run_swaks_email", fake_swaks)
-    args = Namespace(
-        smtp_credentials=path,
-        google_password_file=tmp_path / "missing-google",
-        smtp_auth_user="",
-        smtp_server="mail.smtp2go.com:2525",
-        email_to="ryan.grimm@gmail.com",
-        email_from="ryan.grimm@gmail.com",
-        timezone="America/New_York",
-    )
+    args = _args(tmp_path, email_provider="smtp2go", smtp_credentials=path)
     assert scout.send_test_email(args) == 0
     assert sent["auth_user"] == "smtp2go-user"
     assert sent["password"] == "smtp2go-secret"

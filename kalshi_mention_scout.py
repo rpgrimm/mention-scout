@@ -41,11 +41,11 @@ Changes in v10:
     corrected query-status marker.
 
 Changes in v16.5 / MS-0020:
-  * Default SMTP is SMTP2GO ``mail.smtp2go.com:2525`` (STARTTLS via swaks ``--tls``).
-  * Username and password come from ``~/.config/mention-scout/smtp``
-    (``SMTP_USERNAME`` / ``SMTP_PASSWORD``, mode 600). ``--test-email`` still
-    sends one message and exits. Legacy ``~/.config/.google-password`` remains
-    a fallback if the new file is missing.
+  * Email provider is selected by ``~/.config/mention-scout/email.json``
+    (``{"provider": "google"|"smtp2go"}``). Missing file defaults to Google
+    (``smtp.gmail.com:587`` + ``~/.config/.google-password``) so existing hosts
+    keep working. ``smtp2go`` uses ``mail.smtp2go.com:2525`` and
+    ``~/.config/mention-scout/smtp``. ``--test-email`` sends one message and exits.
 
 Changes in v16.4 / MS-0018:
   * --watch-new persists seen parent event tickers under
@@ -155,8 +155,12 @@ QUEUE_FORMAT_VERSION = 1
 WATCH_SEEN_FILE_VERSION = 2
 DEFAULT_GOOGLE_PASSWORD_FILE = Path("~/.config/.google-password")
 DEFAULT_MENTION_SCOUT_CONFIG_DIR = Path("~/.config/mention-scout")
+DEFAULT_EMAIL_CONFIG_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "email.json"
 DEFAULT_SMTP_CREDENTIALS_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "smtp"
-DEFAULT_SMTP_SERVER = "mail.smtp2go.com:2525"
+DEFAULT_GMAIL_SMTP_SERVER = "smtp.gmail.com:587"
+DEFAULT_SMTP2GO_SERVER = "mail.smtp2go.com:2525"
+DEFAULT_GMAIL_AUTH_USER = "ryan.grimm@gmail.com"
+DEFAULT_EMAIL_PROVIDER = "google"
 DEFAULT_CALENDAR_MATCHES_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "calendar-matches.json"
 DEFAULT_CALENDAR_CLIENT_SECRET_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "client_secret.json"
 DEFAULT_CALENDAR_TOKEN_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "token.json"
@@ -1600,6 +1604,8 @@ def _watch_child_arguments(original_argv: list[str]) -> list[str]:
         "--watch-seen-file",
         "--google-password-file",
         "--smtp-credentials",
+        "--email-config",
+        "--email-provider",
         "--calendar-matches",
         "--calendar-client-secret",
         "--calendar-token",
@@ -1749,20 +1755,109 @@ class SmtpCredentials:
     password: str
 
 
+@dataclass(frozen=True)
+class EmailProvider:
+    """Built-in SMTP profile selected by email.json or --email-provider."""
+
+    id: str
+    smtp_server: str
+    default_auth_user: str
+    credentials_attr: str
+    missing_name: str
+    missing_hint: str
+    empty_password_hint: str
+
+
+EMAIL_PROVIDERS: dict[str, EmailProvider] = {
+    "google": EmailProvider(
+        id="google",
+        smtp_server=DEFAULT_GMAIL_SMTP_SERVER,
+        default_auth_user=DEFAULT_GMAIL_AUTH_USER,
+        credentials_attr="google_password_file",
+        missing_name="Google password file",
+        missing_hint=(
+            "Create it with GOOGLE_PASSWORD='your Gmail app password' and chmod 600 it."
+        ),
+        empty_password_hint="Set GOOGLE_PASSWORD='your Gmail app password' in that file.",
+    ),
+    "smtp2go": EmailProvider(
+        id="smtp2go",
+        smtp_server=DEFAULT_SMTP2GO_SERVER,
+        default_auth_user="",
+        credentials_attr="smtp_credentials",
+        missing_name="SMTP credentials file",
+        missing_hint="Create it with SMTP_USERNAME=... and SMTP_PASSWORD=... and chmod 600 it.",
+        empty_password_hint="Set SMTP_USERNAME and SMTP_PASSWORD in that file.",
+    ),
+}
+EMAIL_PROVIDER_ALIASES = {
+    "google": "google",
+    "gmail": "google",
+    "smtp2go": "smtp2go",
+    "smtp": "smtp2go",
+    "smtp_2go": "smtp2go",
+}
+
+
+def normalize_email_provider(value: Any) -> str:
+    raw = str(value or "").strip().casefold().replace(" ", "")
+    if not raw:
+        return DEFAULT_EMAIL_PROVIDER
+    provider = EMAIL_PROVIDER_ALIASES.get(raw)
+    if provider is None:
+        known = ", ".join(sorted(EMAIL_PROVIDERS))
+        raise RuntimeError(f"Unknown email provider {value!r}. Known: {known}")
+    return provider
+
+
+def load_email_provider_config(path: Path) -> str:
+    """Read provider from email.json. Missing file defaults to google."""
+    config_path = path.expanduser()
+    if not config_path.exists():
+        return DEFAULT_EMAIL_PROVIDER
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"email config is not valid JSON ({config_path}): {exc.msg}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"cannot read email config {config_path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"email config must be a JSON object: {config_path}")
+    return normalize_email_provider(payload.get("provider"))
+
+
+def apply_email_provider(args: argparse.Namespace) -> EmailProvider:
+    """Resolve google vs smtp2go and fill blank SMTP host from the profile."""
+    explicit = str(getattr(args, "email_provider", "") or "").strip()
+    if explicit:
+        provider_id = normalize_email_provider(explicit)
+    else:
+        config_path = Path(getattr(args, "email_config", DEFAULT_EMAIL_CONFIG_FILE))
+        provider_id = load_email_provider_config(config_path)
+    profile = EMAIL_PROVIDERS[provider_id]
+    args._email_provider = provider_id
+    if not str(getattr(args, "smtp_server", "") or "").strip():
+        args.smtp_server = profile.smtp_server
+    return profile
+
+
 def resolve_smtp_credentials_path(args: argparse.Namespace) -> Path:
-    """Prefer ~/.config/mention-scout/smtp; fall back to legacy Google password file."""
-    smtp_path = Path(getattr(args, "smtp_credentials", DEFAULT_SMTP_CREDENTIALS_FILE)).expanduser()
-    google_path = Path(
-        getattr(args, "google_password_file", DEFAULT_GOOGLE_PASSWORD_FILE)
-    ).expanduser()
-    if smtp_path.exists():
-        return smtp_path
-    if google_path.exists():
-        return google_path
-    return smtp_path
+    """Credential file for the selected email provider."""
+    profile = apply_email_provider(args)
+    default_path = (
+        DEFAULT_SMTP_CREDENTIALS_FILE if profile.id == "smtp2go" else DEFAULT_GOOGLE_PASSWORD_FILE
+    )
+    path = Path(getattr(args, profile.credentials_attr, default_path))
+    return path.expanduser()
 
 
-def load_smtp_credentials(credentials_file: Path) -> SmtpCredentials:
+def load_smtp_credentials(
+    credentials_file: Path,
+    *,
+    provider: str = "smtp2go",
+) -> SmtpCredentials:
     """Source a zsh/sh credential file and return SMTP username + password.
 
     Recognizes ``SMTP_USERNAME`` / ``SMTP_USER`` / ``SMTP_AUTH_USER`` and
@@ -1770,22 +1865,22 @@ def load_smtp_credentials(credentials_file: Path) -> SmtpCredentials:
     parsed as JSON so ordinary shell assignments work. Values are never printed,
     cached, or placed in the scout's own environment.
     """
+    profile = EMAIL_PROVIDERS.get(provider) or EMAIL_PROVIDERS["smtp2go"]
     path = credentials_file.expanduser()
     try:
         stat = path.stat()
     except FileNotFoundError as exc:
         raise RuntimeError(
-            f"SMTP credentials file is missing: {path}. "
-            "Create it with SMTP_USERNAME=... and SMTP_PASSWORD=... and chmod 600 it."
+            f"{profile.missing_name} is missing: {path}. {profile.missing_hint}"
         ) from exc
     except OSError as exc:
-        raise RuntimeError(f"Cannot read SMTP credentials file {path}: {exc}") from exc
+        raise RuntimeError(f"Cannot read {profile.missing_name.lower()} {path}: {exc}") from exc
 
     if not path.is_file():
-        raise RuntimeError(f"SMTP credentials path is not a regular file: {path}")
+        raise RuntimeError(f"{profile.missing_name} path is not a regular file: {path}")
     if stat.st_mode & 0o077:
         raise RuntimeError(
-            f"SMTP credentials file permissions are too broad: {path} "
+            f"{profile.missing_name} permissions are too broad: {path} "
             f"(run: chmod 600 {path})"
         )
 
@@ -1821,15 +1916,14 @@ def load_smtp_credentials(credentials_file: Path) -> SmtpCredentials:
     username = username.strip()
     if not password:
         raise RuntimeError(
-            f"SMTP_PASSWORD was not set by {path}. "
-            "Set SMTP_PASSWORD='...' (or GOOGLE_PASSWORD for the legacy file) in that file."
+            f"Password was not set by {path}. {profile.empty_password_hint}"
         )
     return SmtpCredentials(username=username, password=password)
 
 
 def load_google_password(password_file: Path) -> str:
     """Legacy helper: source a credential file and return the password only."""
-    return load_smtp_credentials(password_file).password
+    return load_smtp_credentials(password_file, provider="google").password
 
 
 def run_swaks_email(
@@ -3357,10 +3451,15 @@ def maybe_add_calendar_event_for_new_market(
 
 
 def verify_email_configuration(args: argparse.Namespace) -> str:
-    """Fail fast and return the SMTP password; fill smtp_auth_user from the file if needed."""
+    """Fail fast and return the SMTP password; fill host/user from the selected provider."""
+    profile = apply_email_provider(args)
     path = resolve_smtp_credentials_path(args)
-    creds = load_smtp_credentials(path)
-    username = str(getattr(args, "smtp_auth_user", "") or "").strip() or creds.username
+    creds = load_smtp_credentials(path, provider=profile.id)
+    username = (
+        str(getattr(args, "smtp_auth_user", "") or "").strip()
+        or creds.username
+        or profile.default_auth_user
+    )
     if not username:
         raise RuntimeError(
             f"SMTP username missing: set SMTP_USERNAME in {path} or pass --smtp-auth-user"
@@ -3416,7 +3515,7 @@ def send_test_email(args: argparse.Namespace) -> int:
             f"Sent: {format_local_time(now, local_tz)}\n"
             "Sample Kalshi market link:\n"
             "https://kalshi.com/markets/kxearningsmentionccl/what-will-carnival-cruise-say-during-their-next-earnings-call/kxearningsmentionccl-26jun23\n\n"
-            "This confirms --email-new can use ~/.config/mention-scout/smtp and swaks."
+            "This confirms --email-new SMTP via ~/.config/mention-scout/email.json and swaks."
         ),
     )
     print(f"test email sent to {args.email_to}", flush=True)
@@ -3917,26 +4016,37 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "With --watch-new, email one concise parent-event overview through swaks "
-            "for every newly discovered market. Fails fast unless ~/.config/mention-scout/smtp "
-            "defines SMTP_USERNAME and SMTP_PASSWORD (legacy ~/.config/.google-password still works)."
+            "for every newly discovered market. Provider comes from ~/.config/mention-scout/email.json "
+            "(default google if missing). smtp2go uses ~/.config/mention-scout/smtp."
         ),
     )
     parser.add_argument(
         "--test-email",
         action="store_true",
-        help="Source SMTP credentials, send one test email, then exit",
+        help="Source SMTP credentials for the selected provider, send one test email, then exit",
+    )
+    parser.add_argument(
+        "--email-config",
+        type=Path,
+        default=DEFAULT_EMAIL_CONFIG_FILE,
+        help="JSON email.json with provider google or smtp2go; missing file defaults to google",
+    )
+    parser.add_argument(
+        "--email-provider",
+        default="",
+        help="Override email.json: google or smtp2go",
     )
     parser.add_argument(
         "--smtp-credentials",
         type=Path,
         default=DEFAULT_SMTP_CREDENTIALS_FILE,
-        help="zsh/sh file sourced for SMTP_USERNAME and SMTP_PASSWORD by --email-new and --test-email",
+        help="SMTP2GO zsh/sh file (SMTP_USERNAME / SMTP_PASSWORD)",
     )
     parser.add_argument(
         "--google-password-file",
         type=Path,
         default=DEFAULT_GOOGLE_PASSWORD_FILE,
-        help="Legacy credential file (GOOGLE_PASSWORD) used if --smtp-credentials is missing",
+        help="Google/Gmail credential file (GOOGLE_PASSWORD) used when provider is google",
     )
     parser.add_argument(
         "--email-to",
@@ -3950,13 +4060,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--smtp-server",
-        default=DEFAULT_SMTP_SERVER,
-        help="swaks SMTP host:port used by --email-new (default: SMTP2GO mail.smtp2go.com:2525)",
+        default="",
+        help="swaks SMTP host:port; default from email provider (google: smtp.gmail.com:587, smtp2go: mail.smtp2go.com:2525)",
     )
     parser.add_argument(
         "--smtp-auth-user",
         default="",
-        help="swaks SMTP auth user; default is SMTP_USERNAME from --smtp-credentials",
+        help="swaks SMTP auth user; default is SMTP_USERNAME (smtp2go) or ryan.grimm@gmail.com (google)",
     )
     parser.add_argument(
         "--calendar-add-new",

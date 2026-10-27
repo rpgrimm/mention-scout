@@ -16,7 +16,7 @@ RestartSec=30
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=mention-scout-watch
-# Do not embed secrets. App loads ~/.config/mention-scout/smtp by default.
+# Do not embed secrets. App loads ~/.config/mention-scout/email.json (default google).
 NoNewPrivileges=true
 
 [Install]

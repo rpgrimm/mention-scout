@@ -7,11 +7,9 @@ Branch: `openclaw/ms-0020` + PR into `main`. Do not merge until owner desktop/se
 
 ## Behavior
 
-- Default SMTP: `mail.smtp2go.com:2525` (swaks `--tls` STARTTLS, same as previous Gmail 587).
-- Credentials file: `~/.config/mention-scout/smtp` (mode `600`), sourced like the old Google file:
-  - `SMTP_USERNAME` (aliases: `SMTP_USER`, `SMTP_AUTH_USER`)
-  - `SMTP_PASSWORD` (alias: `GOOGLE_PASSWORD`)
-- `--smtp-auth-user` overrides the file username when set.
-- Missing smtp file falls back to `~/.config/.google-password`.
-- `--test-email` sends one message and exits (already existed; docs/help updated).
+- Provider file: `~/.config/mention-scout/email.json` with `{"provider": "google"|"smtp2go"}`.
+- **Missing file defaults to `google`** so RIP / existing Gmail hosts keep working (`smtp.gmail.com:587` + `~/.config/.google-password`).
+- `smtp2go`: `mail.smtp2go.com:2525` + `~/.config/mention-scout/smtp` (`SMTP_USERNAME` / `SMTP_PASSWORD`, mode `600`).
+- `--email-provider` overrides the JSON. `--smtp-server` / `--smtp-auth-user` still override host/user.
+- `--test-email` sends one message and exits.
 - Discovery only. No trading. Never print the password.

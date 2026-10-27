@@ -75,28 +75,37 @@ New-market email subjects look like:
 
 ## Email setup (optional)
 
-Used only by `--email-new` / `--test-email`. Default SMTP is **SMTP2GO** `mail.smtp2go.com:2525`.
+Used only by `--email-new` / `--test-email`. Provider is selected by `~/.config/mention-scout/email.json`. **If that file is missing, the scout keeps the old Google/Gmail setup** (`smtp.gmail.com:587` + `~/.config/.google-password`).
 
-1. Install [swaks](https://www.jetmore.org/john/code/swaks/) and put it on `PATH`.
-2. Create `~/.config/mention-scout/smtp` (mode `600`) with the SMTP2GO username and password:
+### Google (default / existing hosts)
+
+```bash
+# ~/.config/.google-password
+GOOGLE_PASSWORD='***'
+chmod 600 ~/.config/.google-password
+./mention_scout.py --test-email
+```
+
+### SMTP2GO (new hosts)
 
 ```bash
 mkdir -p ~/.config/mention-scout
-cat > ~/.config/mention-scout/smtp <<'EOF'
+cp deploy/config/email.example.json ~/.config/mention-scout/email.json
+cat > ~/.config/mention-scout/smtp <<'SMTP'
 SMTP_USERNAME='your-smtp2go-username'
-SMTP_PASSWORD='your-smtp2go-password'
-EOF
-chmod 600 ~/.config/mention-scout/smtp
+SMTP_PASSWORD='***'
+SMTP
+chmod 600 ~/.config/mention-scout/smtp ~/.config/mention-scout/email.json
 ```
 
-3. Prove SMTP (sends one message to the default `--email-to` and exits):
+Install [swaks](https://www.jetmore.org/john/code/swaks/) on `PATH`, then prove SMTP (sends one message and exits):
 
 ```bash
 ./mention_scout.py --test-email
 ./mention_scout.py --test-email --email-to you@example.com --email-from you@example.com
 ```
 
-The credentials file is sourced, never printed or cached by the scout. Override host/port with `--smtp-server host:port`. Legacy `~/.config/.google-password` (`GOOGLE_PASSWORD=...`) is still used if the smtp file is missing.
+`--email-provider google|smtp2go` overrides the JSON. Credentials are sourced, never printed.
 
 ## Google Calendar auto-add (optional)
 
@@ -316,7 +325,7 @@ For unattended `--watch-new` (optionally with email) under **user** systemd — 
 
 - Python 3 on `PATH` (installer records an absolute interpreter path)
 - A git checkout that contains `./mention_scout.py`
-- For email alerts (default in the generated unit): `swaks` on `PATH` and `~/.config/mention-scout/smtp` (mode `600`) — same as interactive `--email-new`
+- For email alerts (default in the generated unit): `swaks` on `PATH` plus Google (`~/.config/.google-password`) or SMTP2GO (`email.json` + `smtp`) — same as interactive `--email-new`
 - A working user systemd session (`systemctl --user`)
 
 ### Install (one-liner)
@@ -380,7 +389,7 @@ Uninstall disables the unit, removes `~/.config/systemd/user/mention-scout-watch
 
 ### Ops caution (email noise)
 
-Unattended `--email-new` can mail on every newly seen parent event. If classification is noisy, prefer `--no-email` until you are happy with interactive watch output. No secrets are written into the unit file; the app still loads `~/.config/mention-scout/smtp` at runtime.
+Unattended `--email-new` can mail on every newly seen parent event. If classification is noisy, prefer `--no-email` until you are happy with interactive watch output. No secrets are written into the unit file; the app loads `~/.config/mention-scout/email.json` and the matching credential file at runtime.
 
 ### Template location
 
