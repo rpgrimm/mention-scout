@@ -20,6 +20,14 @@ If you already have the repo checked out:
 
 Requirements: **Python 3** (stdlib only). No `pip install` for basic discovery.
 
+Optional editable install (puts `mention-scout` and `mention-markets` on `PATH`):
+
+```bash
+python3 -m pip install -e .
+python3 -m pip install -e '.[calendar]'   # Google Calendar extra
+mention-scout --overview
+```
+
 ## Common commands
 
 ```bash
@@ -209,7 +217,8 @@ Prefer the helper over hand-editing JSON when adding/updating one phrase:
 4. Install optional libraries (core scout stays stdlib-only without calendar):
 
 ```bash
-python3 -m pip install --user google-auth google-auth-oauthlib google-api-python-client
+python3 -m pip install -e '.[calendar]'
+# or: python3 -m pip install --user google-auth google-auth-oauthlib google-api-python-client
 ```
 
 5. Run one-shot browser consent (not inside systemd):

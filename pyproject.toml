@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mention-scout"
+version = "16.5.0"
+description = "Find Kalshi mention markets and optionally watch, email, and add matches to Google Calendar."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Ryan Grimm" }]
+# Discovery/notification only. No trading.
+
+[project.optional-dependencies]
+calendar = [
+    "google-auth",
+    "google-auth-oauthlib",
+    "google-api-python-client",
+]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+mention-scout = "kalshi_mention_scout:main"
+mention-markets = "mention_markets:main"
+
+[tool.setuptools]
+py-modules = ["kalshi_mention_scout", "mention_markets"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
