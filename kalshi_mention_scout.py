@@ -46,6 +46,8 @@ Changes in v16.5 / MS-0020:
     (``smtp.gmail.com:587`` + ``~/.config/.google-password``) so existing hosts
     keep working. ``smtp2go`` uses ``mail.smtp2go.com:2525`` and
     ``~/.config/mention-scout/smtp``. ``--test-email`` sends one message and exits.
+  * ``--test-calendar`` inserts a dummy timed event at today 12:00 in ``--timezone``,
+    GETs it to confirm, then deletes it.
 
 Changes in v16.4 / MS-0018:
   * --watch-new persists seen parent event tickers under
@@ -1588,6 +1590,7 @@ def _watch_child_arguments(original_argv: list[str]) -> list[str]:
         "--email-new",
         "--queue-initialized",
         "--test-email",
+        "--test-calendar",
         "--calendar-add-new",
         "--calendar-auth",
         "--audit-calendar-matches",
@@ -2044,6 +2047,12 @@ class CalendarClient(Protocol):
         send_updates: str | None = None,
     ) -> dict[str, Any]:
         """Create one calendar event and return the API-like response dict."""
+
+    def get_event(self, calendar_id: str, event_id: str) -> dict[str, Any]:
+        """Fetch one calendar event by id."""
+
+    def delete_event(self, calendar_id: str, event_id: str) -> None:
+        """Delete one calendar event by id."""
 
 
 class CalendarMatchCache:
@@ -3290,6 +3299,25 @@ class GoogleCalendarApiClient:
             raise RuntimeError("Google Calendar API insert returned a non-object response")
         return result
 
+    def get_event(self, calendar_id: str, event_id: str) -> dict[str, Any]:
+        try:
+            result = self._service.events().get(
+                calendarId=calendar_id, eventId=event_id
+            ).execute(num_retries=2)
+        except Exception as exc:  # noqa: BLE001 - normalize all API failures
+            raise RuntimeError(f"Google Calendar API get failed: {exc}") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError("Google Calendar API get returned a non-object response")
+        return result
+
+    def delete_event(self, calendar_id: str, event_id: str) -> None:
+        try:
+            self._service.events().delete(
+                calendarId=calendar_id, eventId=event_id
+            ).execute(num_retries=2)
+        except Exception as exc:  # noqa: BLE001 - normalize all API failures
+            raise RuntimeError(f"Google Calendar API delete failed: {exc}") from exc
+
 
 def run_calendar_auth(args: argparse.Namespace) -> int:
     """One-shot interactive OAuth; write token.json and exit."""
@@ -3303,6 +3331,113 @@ def run_calendar_auth(args: argparse.Namespace) -> int:
         raise SystemExit(f"calendar auth failed: {exc}") from exc
     token_path = args.calendar_token.expanduser()
     print(f"calendar auth ok; token written to {token_path}", flush=True)
+    return 0
+
+
+TEST_CALENDAR_SUMMARY = "[Kalshi] mention scout calendar test"
+TEST_CALENDAR_DURATION_MINUTES = 15
+
+
+def calendar_error_is_missing(error: BaseException) -> bool:
+    """Return True when a Calendar get/delete error means the event is gone."""
+    text = str(error).lower()
+    if "404" in text or "410" in text or "not found" in text or "notfound" in text:
+        return True
+    status = getattr(getattr(error, "resp", None), "status", None)
+    if status in {404, 410}:
+        return True
+    cause = error.__cause__
+    if cause is not None and cause is not error:
+        return calendar_error_is_missing(cause)
+    return False
+
+
+def build_test_calendar_event_body(now: datetime, local_tz: ZoneInfo) -> dict[str, Any]:
+    """Dummy timed event: today's date at 12:00 in ``local_tz``, 15 minutes."""
+    local_now = now.astimezone(local_tz)
+    start = datetime(
+        local_now.year,
+        local_now.month,
+        local_now.day,
+        12,
+        0,
+        tzinfo=local_tz,
+    )
+    end = start + timedelta(minutes=TEST_CALENDAR_DURATION_MINUTES)
+    tz_name = getattr(local_tz, "key", str(local_tz))
+    return {
+        "summary": TEST_CALENDAR_SUMMARY,
+        "description": (
+            "Dummy event from mention-scout --test-calendar.\n"
+            "Inserted to verify Google Calendar access, then deleted.\n"
+            f"Timezone: {tz_name}"
+        ),
+        "start": {"dateTime": start.isoformat(), "timeZone": tz_name},
+        "end": {"dateTime": end.isoformat(), "timeZone": tz_name},
+    }
+
+
+def send_test_calendar(
+    args: argparse.Namespace,
+    *,
+    calendar_client: CalendarClient | None = None,
+    now: datetime | None = None,
+) -> int:
+    """Insert a dummy noon event, confirm it exists, delete it, then exit."""
+    try:
+        local_tz = ZoneInfo(args.timezone)
+    except Exception as exc:
+        raise SystemExit(f"Invalid --timezone {args.timezone!r}: {exc}") from exc
+    if calendar_client is None:
+        credentials = load_google_calendar_credentials(
+            client_secret_path=args.calendar_client_secret,
+            token_path=args.calendar_token,
+            allow_interactive=False,
+        )
+        calendar_client = GoogleCalendarApiClient.from_credentials(credentials)
+    when = now if now is not None else datetime.now(local_tz)
+    body = build_test_calendar_event_body(when, local_tz)
+    calendar_id = str(getattr(args, "calendar_id", DEFAULT_CALENDAR_ID) or DEFAULT_CALENDAR_ID)
+    inserted = calendar_client.insert_event(calendar_id, body)
+    event_id = str(inserted.get("id") or "").strip()
+    html_link = str(inserted.get("htmlLink") or "").strip()
+    if not event_id:
+        raise RuntimeError("calendar insert returned no event id")
+    start_label = body["start"].get("dateTime") or ""
+    print(
+        f"calendar test inserted {event_id} at {start_label}"
+        + (f" {html_link}" if html_link else ""),
+        flush=True,
+    )
+    delete_error: BaseException | None = None
+    try:
+        fetched = calendar_client.get_event(calendar_id, event_id)
+        fetched_id = str(fetched.get("id") or "").strip()
+        if fetched_id != event_id:
+            raise RuntimeError(
+                f"calendar get returned a different event id ({fetched_id!r} != {event_id!r})"
+            )
+        print("calendar test confirmed event exists", flush=True)
+    finally:
+        try:
+            calendar_client.delete_event(calendar_id, event_id)
+        except Exception as exc:  # noqa: BLE001 - always try to clean up
+            delete_error = exc
+    if delete_error is not None:
+        raise RuntimeError(
+            f"inserted and confirmed {html_link or event_id} but delete failed: {delete_error}. "
+            "Delete the dummy event in Google Calendar."
+        ) from delete_error
+    try:
+        calendar_client.get_event(calendar_id, event_id)
+    except RuntimeError as exc:
+        if not calendar_error_is_missing(exc):
+            raise
+    else:
+        raise RuntimeError(
+            f"delete reported success but event still exists: {html_link or event_id}"
+        )
+    print("calendar test deleted dummy event", flush=True)
     return 0
 
 
@@ -4101,6 +4236,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Source SMTP credentials for the selected provider, send one test email, then exit",
     )
     parser.add_argument(
+        "--test-calendar",
+        action="store_true",
+        help="Insert a dummy Google Calendar event at today 12:00, confirm it exists, delete it, then exit",
+    )
+    parser.add_argument(
         "--email-config",
         type=Path,
         default=DEFAULT_EMAIL_CONFIG_FILE,
@@ -4362,6 +4502,7 @@ def main() -> int:
             ("--email-new", args.email_new),
             ("--queue-initialized", args.queue_initialized),
             ("--test-email", args.test_email),
+            ("--test-calendar", args.test_calendar),
             ("--calendar-add-new", args.calendar_add_new),
             ("--calendar-auth", args.calendar_auth),
             ("--invite-email", bool(args.invite_emails)),
@@ -4393,6 +4534,7 @@ def main() -> int:
                 ("--email-new", args.email_new),
                 ("--queue-initialized", args.queue_initialized),
                 ("--test-email", args.test_email),
+                ("--test-calendar", args.test_calendar),
                 ("--calendar-add-new", args.calendar_add_new),
             )
             if enabled
@@ -4406,15 +4548,31 @@ def main() -> int:
             raise SystemExit("--calendar-duration-minutes must be greater than zero")
         return run_calendar_auth(args)
     if args.test_email:
-        if args.watch_new or args.email_new or args.queue_initialized or args.calendar_add_new:
+        if (
+            args.watch_new
+            or args.email_new
+            or args.queue_initialized
+            or args.calendar_add_new
+            or args.test_calendar
+        ):
             raise SystemExit(
                 "--test-email sends once and cannot be combined with --watch-new, "
-                "--email-new, --queue-initialized, or --calendar-add-new"
+                "--email-new, --queue-initialized, --calendar-add-new, or --test-calendar"
             )
         try:
             return send_test_email(args)
         except RuntimeError as exc:
             raise SystemExit(f"email test failed: {exc}") from exc
+    if args.test_calendar:
+        if args.watch_new or args.email_new or args.queue_initialized or args.calendar_add_new:
+            raise SystemExit(
+                "--test-calendar is a one-shot command and cannot be combined with "
+                "--watch-new, --email-new, --queue-initialized, or --calendar-add-new"
+            )
+        try:
+            return send_test_calendar(args)
+        except RuntimeError as exc:
+            raise SystemExit(f"calendar test failed: {exc}") from exc
     if args.email_new and not args.watch_new:
         raise SystemExit("--email-new is only valid together with --watch-new")
     if args.watch_seen_file is not None and not args.watch_new:
