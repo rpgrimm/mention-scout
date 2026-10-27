@@ -1,0 +1,5 @@
+# Copy to ~/.config/mention-scout/smtp and chmod 600.
+# Used by --email-new and --test-email. Never commit the real file.
+
+SMTP_USERNAME='your-smtp2go-username'
+SMTP_PASSWORD='your-smtp2go-password'

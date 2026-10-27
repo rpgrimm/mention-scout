@@ -40,6 +40,15 @@ Changes in v10:
   * Bumps the cache format so a v9 compact cache is rebuilt once with the
     corrected query-status marker.
 
+Changes in v16.5 / MS-0020:
+  * Email provider is selected by ``~/.config/mention-scout/email.json``
+    (``{"provider": "google"|"smtp2go"}``). Missing file defaults to Google
+    (``smtp.gmail.com:587`` + ``~/.config/.google-password``) so existing hosts
+    keep working. ``smtp2go`` uses ``mail.smtp2go.com:2525`` and
+    ``~/.config/mention-scout/smtp``. ``--test-email`` sends one message and exits.
+  * ``--test-calendar`` inserts a dummy timed event at today 12:00 in ``--timezone``,
+    waits for you to confirm it in Google Calendar, then deletes it. ``--yes`` skips the wait.
+
 Changes in v16.4 / MS-0018:
   * --watch-new persists seen parent event tickers under
     $XDG_STATE_HOME/mention-scout/seen-event-tickers.json (default
@@ -138,7 +147,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-VERSION = "16.4.0"
+VERSION = "16.5.0"
 CACHE_FORMAT_VERSION = 5
 DEFAULT_MENTION_CACHE_FILE = ".kalshi_mention_scout_mentions_cache.json"
 DEFAULT_FULL_CACHE_FILE = ".kalshi_mention_scout_full_cache.json"
@@ -148,6 +157,14 @@ QUEUE_FORMAT_VERSION = 1
 WATCH_SEEN_FILE_VERSION = 2
 DEFAULT_GOOGLE_PASSWORD_FILE = Path("~/.config/.google-password")
 DEFAULT_MENTION_SCOUT_CONFIG_DIR = Path("~/.config/mention-scout")
+DEFAULT_EMAIL_CONFIG_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "email.json"
+DEFAULT_SMTP_CREDENTIALS_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "smtp"
+DEFAULT_GMAIL_SMTP_SERVER = "smtp.gmail.com:587"
+DEFAULT_SMTP2GO_SERVER = "mail.smtp2go.com:2525"
+DEFAULT_GMAIL_AUTH_USER = "ryan.grimm@gmail.com"
+DEFAULT_GMAIL_FROM = "ryan.grimm@gmail.com"
+DEFAULT_SMTP2GO_FROM = "ryan@ryangrimm.net"
+DEFAULT_EMAIL_PROVIDER = "google"
 DEFAULT_CALENDAR_MATCHES_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "calendar-matches.json"
 DEFAULT_CALENDAR_CLIENT_SECRET_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "client_secret.json"
 DEFAULT_CALENDAR_TOKEN_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "token.json"
@@ -1573,6 +1590,8 @@ def _watch_child_arguments(original_argv: list[str]) -> list[str]:
         "--email-new",
         "--queue-initialized",
         "--test-email",
+        "--test-calendar",
+        "--yes",
         "--calendar-add-new",
         "--calendar-auth",
         "--audit-calendar-matches",
@@ -1590,6 +1609,9 @@ def _watch_child_arguments(original_argv: list[str]) -> list[str]:
         "--queue-dir",
         "--watch-seen-file",
         "--google-password-file",
+        "--smtp-credentials",
+        "--email-config",
+        "--email-provider",
         "--calendar-matches",
         "--calendar-client-secret",
         "--calendar-token",
@@ -1731,76 +1753,246 @@ def format_overview_email(event: dict[str, Any], detected_at: datetime, local_tz
     return "\n".join(lines)
 
 
-def load_google_password(password_file: Path) -> str:
-    """Source a zsh credential file and return its GOOGLE_PASSWORD value.
+@dataclass(frozen=True)
+class SmtpCredentials:
+    """SMTP auth values sourced from a local 600-mode file. Never logged."""
 
-    The file is intentionally sourced rather than parsed as JSON or dotenv so
-    either ``GOOGLE_PASSWORD=...`` or ``export GOOGLE_PASSWORD=...`` works.
-    It is never printed, cached, or placed in the scout's own environment.
+    username: str
+    password: str
+
+
+@dataclass(frozen=True)
+class EmailProvider:
+    """Built-in SMTP profile selected by email.json or --email-provider."""
+
+    id: str
+    smtp_server: str
+    default_auth_user: str
+    credentials_attr: str
+    missing_name: str
+    missing_hint: str
+    empty_password_hint: str
+
+
+EMAIL_PROVIDERS: dict[str, EmailProvider] = {
+    "google": EmailProvider(
+        id="google",
+        smtp_server=DEFAULT_GMAIL_SMTP_SERVER,
+        default_auth_user=DEFAULT_GMAIL_AUTH_USER,
+        credentials_attr="google_password_file",
+        missing_name="Google password file",
+        missing_hint=(
+            "Create it with GOOGLE_PASSWORD='your Gmail app password' and chmod 600 it."
+        ),
+        empty_password_hint="Set GOOGLE_PASSWORD='your Gmail app password' in that file.",
+    ),
+    "smtp2go": EmailProvider(
+        id="smtp2go",
+        smtp_server=DEFAULT_SMTP2GO_SERVER,
+        default_auth_user="",
+        credentials_attr="smtp_credentials",
+        missing_name="SMTP credentials file",
+        missing_hint="Create it with SMTP_USERNAME=... and SMTP_PASSWORD=... and chmod 600 it.",
+        empty_password_hint="Set SMTP_USERNAME and SMTP_PASSWORD in that file.",
+    ),
+}
+EMAIL_PROVIDER_ALIASES = {
+    "google": "google",
+    "gmail": "google",
+    "smtp2go": "smtp2go",
+    "smtp": "smtp2go",
+    "smtp_2go": "smtp2go",
+}
+
+
+def normalize_email_provider(value: Any) -> str:
+    raw = str(value or "").strip().casefold().replace(" ", "")
+    if not raw:
+        return DEFAULT_EMAIL_PROVIDER
+    provider = EMAIL_PROVIDER_ALIASES.get(raw)
+    if provider is None:
+        known = ", ".join(sorted(EMAIL_PROVIDERS))
+        raise RuntimeError(f"Unknown email provider {value!r}. Known: {known}")
+    return provider
+
+
+@dataclass(frozen=True)
+class EmailFileConfig:
+    """Owner email.json: provider plus optional from/to overrides."""
+
+    provider: str
+    from_addr: str = ""
+    to_addr: str = ""
+
+
+def load_email_file_config(path: Path) -> EmailFileConfig:
+    """Read ~/.config/mention-scout/email.json. Missing file defaults to google."""
+    config_path = path.expanduser()
+    if not config_path.exists():
+        return EmailFileConfig(provider=DEFAULT_EMAIL_PROVIDER)
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"email config is not valid JSON ({config_path}): {exc.msg}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"cannot read email config {config_path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"email config must be a JSON object: {config_path}")
+    from_addr = str(payload.get("from") or payload.get("email_from") or "").strip()
+    to_addr = str(payload.get("to") or payload.get("email_to") or "").strip()
+    return EmailFileConfig(
+        provider=normalize_email_provider(payload.get("provider")),
+        from_addr=from_addr,
+        to_addr=to_addr,
+    )
+
+
+def load_email_provider_config(path: Path) -> str:
+    """Read provider from email.json. Missing file defaults to google."""
+    return load_email_file_config(path).provider
+
+
+def apply_email_provider(args: argparse.Namespace) -> EmailProvider:
+    """Resolve google vs smtp2go and fill blank SMTP host/from from the profile."""
+    config_path = Path(getattr(args, "email_config", DEFAULT_EMAIL_CONFIG_FILE))
+    file_cfg = load_email_file_config(config_path)
+    explicit = str(getattr(args, "email_provider", "") or "").strip()
+    provider_id = normalize_email_provider(explicit) if explicit else file_cfg.provider
+    profile = EMAIL_PROVIDERS[provider_id]
+    args._email_provider = provider_id
+    if not str(getattr(args, "smtp_server", "") or "").strip():
+        args.smtp_server = profile.smtp_server
+    if not str(getattr(args, "email_from", "") or "").strip():
+        if file_cfg.from_addr:
+            args.email_from = file_cfg.from_addr
+        elif provider_id == "smtp2go":
+            args.email_from = DEFAULT_SMTP2GO_FROM
+        else:
+            args.email_from = DEFAULT_GMAIL_FROM
+    if file_cfg.to_addr and not str(getattr(args, "email_to", "") or "").strip():
+        args.email_to = file_cfg.to_addr
+    return profile
+
+
+def resolve_smtp_credentials_path(args: argparse.Namespace) -> Path:
+    """Credential file for the selected email provider."""
+    profile = apply_email_provider(args)
+    default_path = (
+        DEFAULT_SMTP_CREDENTIALS_FILE if profile.id == "smtp2go" else DEFAULT_GOOGLE_PASSWORD_FILE
+    )
+    path = Path(getattr(args, profile.credentials_attr, default_path))
+    return path.expanduser()
+
+
+def load_smtp_credentials(
+    credentials_file: Path,
+    *,
+    provider: str = "smtp2go",
+) -> SmtpCredentials:
+    """Source a zsh/sh credential file and return SMTP username + password.
+
+    Recognizes ``SMTP_USERNAME`` / ``SMTP_USER`` / ``SMTP_AUTH_USER`` and
+    ``SMTP_PASSWORD`` / ``GOOGLE_PASSWORD``. The file is sourced rather than
+    parsed as JSON so ordinary shell assignments work. Values are never printed,
+    cached, or placed in the scout's own environment.
     """
-    path = password_file.expanduser()
+    profile = EMAIL_PROVIDERS.get(provider) or EMAIL_PROVIDERS["smtp2go"]
+    path = credentials_file.expanduser()
     try:
         stat = path.stat()
     except FileNotFoundError as exc:
         raise RuntimeError(
-            f"Google password file is missing: {path}. "
-            "Create it with GOOGLE_PASSWORD='your Gmail app password' and chmod 600 it."
+            f"{profile.missing_name} is missing: {path}. {profile.missing_hint}"
         ) from exc
     except OSError as exc:
-        raise RuntimeError(f"Cannot read Google password file {path}: {exc}") from exc
+        raise RuntimeError(f"Cannot read {profile.missing_name.lower()} {path}: {exc}") from exc
 
     if not path.is_file():
-        raise RuntimeError(f"Google password path is not a regular file: {path}")
+        raise RuntimeError(f"{profile.missing_name} path is not a regular file: {path}")
     if stat.st_mode & 0o077:
         raise RuntimeError(
-            f"Google password file permissions are too broad: {path} "
-            "(run: chmod 600 ~/.config/.google-password)"
+            f"{profile.missing_name} permissions are too broad: {path} "
+            f"(run: chmod 600 {path})"
         )
 
-    # zsh is preferred because it matches the user's shell; -f skips startup
-    # files. A POSIX sh fallback supports ordinary GOOGLE_PASSWORD=... files on
-    # hosts that do not have zsh installed.
+    extract = (
+        r'printf "%s\n%s" '
+        r'"${SMTP_USERNAME:-${SMTP_USER:-${SMTP_AUTH_USER-}}}" '
+        r'"${SMTP_PASSWORD:-${GOOGLE_PASSWORD-}}"'
+    )
     commands = [
-        [
-            "zsh",
-            "-f",
-            "-c",
-            'source "$1" >/dev/null; print -rn -- "${GOOGLE_PASSWORD-}"',
-            "kalshi-google-password-loader",
-            str(path),
-        ],
-        [
-            "/bin/sh",
-            "-c",
-            '. "$1" >/dev/null; printf "%s" "${GOOGLE_PASSWORD-}"',
-            "kalshi-google-password-loader",
-            str(path),
-        ],
+        ["zsh", "-f", "-c", f'source "$1" >/dev/null; {extract}', "mention-scout-smtp-loader", str(path)],
+        ["/bin/sh", "-c", f'. "$1" >/dev/null; {extract}', "mention-scout-smtp-loader", str(path)],
     ]
     completed: subprocess.CompletedProcess[str] | None = None
-    missing_shells = 0
     for command in commands:
         try:
             completed = subprocess.run(command, text=True, capture_output=True, check=False)
             break
         except FileNotFoundError:
-            missing_shells += 1
+            continue
         except OSError as exc:
-            raise RuntimeError(f"Could not source Google password file {path}: {exc}") from exc
+            raise RuntimeError(f"Could not source SMTP credentials file {path}: {exc}") from exc
 
     if completed is None:
-        raise RuntimeError("Neither zsh nor /bin/sh was available to source ~/.config/.google-password")
+        raise RuntimeError("Neither zsh nor /bin/sh was available to source SMTP credentials")
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or f"exit {completed.returncode}").strip()
-        raise RuntimeError(f"Could not source Google password file {path}: {detail[:600]}")
+        raise RuntimeError(f"Could not source SMTP credentials file {path}: {detail[:600]}")
 
-    password = completed.stdout
+    raw = completed.stdout or ""
+    username, sep, password = raw.partition("\n")
+    if not sep:
+        username, password = "", raw
+    username = username.strip()
     if not password:
         raise RuntimeError(
-            f"GOOGLE_PASSWORD was not set by {path}. "
-            "Set GOOGLE_PASSWORD='your Gmail app password' in that file."
+            f"Password was not set by {path}. {profile.empty_password_hint}"
         )
-    return password
+    return SmtpCredentials(username=username, password=password)
+
+
+def load_google_password(password_file: Path) -> str:
+    """Legacy helper: source a credential file and return the password only."""
+    return load_smtp_credentials(password_file, provider="google").password
+
+
+def _redact_swaks_transcript(text: str) -> str:
+    """Drop AUTH payloads from a swaks transcript so failures can be shown."""
+    lines: list[str] = []
+    redact_remaining = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        upper = stripped.upper()
+        if "AUTH LOGIN" in upper or "AUTH PLAIN" in upper:
+            lines.append(line)
+            redact_remaining = 2 if "LOGIN" in upper else 1
+            continue
+        if redact_remaining and (stripped.startswith("->") or stripped.startswith("~>")):
+            lines.append(" -> [redacted]")
+            redact_remaining -= 1
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def format_swaks_failure(detail: str, *, sender: str = "") -> str:
+    """Keep the end of the SMTP transcript (where the failure is) plus a short hint."""
+    transcript = _redact_swaks_transcript(detail.strip())
+    if len(transcript) > 1500:
+        transcript = transcript[-1500:]
+    lower = transcript.lower()
+    hint = ""
+    if "535" in transcript or "incorrect authentication" in lower:
+        hint = " SMTP2GO 535: use Sending → SMTP Users (not the dashboard login)."
+    elif "550" in transcript or "verified sender" in lower or "sender identity" in lower:
+        hint = (
+            f" SMTP2GO 550: --email-from {sender!r} must be a verified sender "
+            "(Sending → Verified Senders)."
+        )
+    return f"swaks failed:{hint}\n{transcript}"
 
 
 def run_swaks_email(
@@ -1812,8 +2004,8 @@ def run_swaks_email(
     password: str,
     subject: str,
     body: str,
-) -> None:
-    """Send one plain-text Gmail SMTP message using the user's swaks setup."""
+) -> str:
+    """Send one plain-text SMTP message using the user's swaks setup."""
     command = [
         "swaks",
         "--to", recipient,
@@ -1833,9 +2025,11 @@ def run_swaks_email(
     except OSError as exc:
         raise RuntimeError(f"could not start swaks: {exc}") from exc
 
+    output = f"{completed.stdout or ''}{completed.stderr or ''}"
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or f"exit {completed.returncode}").strip()
-        raise RuntimeError(f"swaks failed: {detail[:600]}")
+        detail = output.strip() or f"exit {completed.returncode}"
+        raise RuntimeError(format_swaks_failure(detail, sender=sender))
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -1854,6 +2048,12 @@ class CalendarClient(Protocol):
         send_updates: str | None = None,
     ) -> dict[str, Any]:
         """Create one calendar event and return the API-like response dict."""
+
+    def get_event(self, calendar_id: str, event_id: str) -> dict[str, Any]:
+        """Fetch one calendar event by id."""
+
+    def delete_event(self, calendar_id: str, event_id: str) -> None:
+        """Delete one calendar event by id."""
 
 
 class CalendarMatchCache:
@@ -3100,6 +3300,25 @@ class GoogleCalendarApiClient:
             raise RuntimeError("Google Calendar API insert returned a non-object response")
         return result
 
+    def get_event(self, calendar_id: str, event_id: str) -> dict[str, Any]:
+        try:
+            result = self._service.events().get(
+                calendarId=calendar_id, eventId=event_id
+            ).execute(num_retries=2)
+        except Exception as exc:  # noqa: BLE001 - normalize all API failures
+            raise RuntimeError(f"Google Calendar API get failed: {exc}") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError("Google Calendar API get returned a non-object response")
+        return result
+
+    def delete_event(self, calendar_id: str, event_id: str) -> None:
+        try:
+            self._service.events().delete(
+                calendarId=calendar_id, eventId=event_id
+            ).execute(num_retries=2)
+        except Exception as exc:  # noqa: BLE001 - normalize all API failures
+            raise RuntimeError(f"Google Calendar API delete failed: {exc}") from exc
+
 
 def run_calendar_auth(args: argparse.Namespace) -> int:
     """One-shot interactive OAuth; write token.json and exit."""
@@ -3114,6 +3333,164 @@ def run_calendar_auth(args: argparse.Namespace) -> int:
     token_path = args.calendar_token.expanduser()
     print(f"calendar auth ok; token written to {token_path}", flush=True)
     return 0
+
+
+TEST_CALENDAR_SUMMARY = "[Kalshi] mention scout calendar test"
+TEST_CALENDAR_DURATION_MINUTES = 15
+
+
+def calendar_error_is_missing(error: BaseException) -> bool:
+    """Return True when a Calendar get/delete error means the event is gone."""
+    text = str(error).lower()
+    if "404" in text or "410" in text or "not found" in text or "notfound" in text:
+        return True
+    status = getattr(getattr(error, "resp", None), "status", None)
+    if status in {404, 410}:
+        return True
+    cause = error.__cause__
+    if cause is not None and cause is not error:
+        return calendar_error_is_missing(cause)
+    return False
+
+
+def calendar_event_is_deleted(payload: dict[str, Any]) -> bool:
+    """Google Calendar delete often leaves a GET-able event with status cancelled."""
+    status = str(payload.get("status") or "").strip().casefold()
+    return status in {"cancelled", "canceled"}
+
+
+def build_test_calendar_event_body(now: datetime, local_tz: ZoneInfo) -> dict[str, Any]:
+    """Dummy timed event: today's date at 12:00 in ``local_tz``, 15 minutes."""
+    local_now = now.astimezone(local_tz)
+    start = datetime(
+        local_now.year,
+        local_now.month,
+        local_now.day,
+        12,
+        0,
+        tzinfo=local_tz,
+    )
+    end = start + timedelta(minutes=TEST_CALENDAR_DURATION_MINUTES)
+    tz_name = getattr(local_tz, "key", str(local_tz))
+    return {
+        "summary": TEST_CALENDAR_SUMMARY,
+        "description": (
+            "Dummy event from mention-scout --test-calendar.\n"
+            "Inserted to verify Google Calendar access, then deleted.\n"
+            f"Timezone: {tz_name}"
+        ),
+        "start": {"dateTime": start.isoformat(), "timeZone": tz_name},
+        "end": {"dateTime": end.isoformat(), "timeZone": tz_name},
+    }
+
+
+def send_test_calendar(
+    args: argparse.Namespace,
+    *,
+    calendar_client: CalendarClient | None = None,
+    now: datetime | None = None,
+    wait_confirm: bool | None = None,
+    confirm_fn: Any | None = None,
+    sleep_fn: Any | None = None,
+    delete_retries: int = 5,
+    delete_retry_seconds: float = 1.0,
+) -> int:
+    """Insert a dummy noon event, wait for owner confirm, delete it, then exit."""
+    try:
+        local_tz = ZoneInfo(args.timezone)
+    except Exception as exc:
+        raise SystemExit(f"Invalid --timezone {args.timezone!r}: {exc}") from exc
+    if calendar_client is None:
+        credentials = load_google_calendar_credentials(
+            client_secret_path=args.calendar_client_secret,
+            token_path=args.calendar_token,
+            allow_interactive=False,
+        )
+        calendar_client = GoogleCalendarApiClient.from_credentials(credentials)
+    when = now if now is not None else datetime.now(local_tz)
+    body = build_test_calendar_event_body(when, local_tz)
+    calendar_id = str(getattr(args, "calendar_id", DEFAULT_CALENDAR_ID) or DEFAULT_CALENDAR_ID)
+    inserted = calendar_client.insert_event(calendar_id, body)
+    event_id = str(inserted.get("id") or "").strip()
+    html_link = str(inserted.get("htmlLink") or "").strip()
+    if not event_id:
+        raise RuntimeError("calendar insert returned no event id")
+    start_label = body["start"].get("dateTime") or ""
+    print(
+        f"calendar test inserted {event_id} at {start_label}"
+        + (f" {html_link}" if html_link else ""),
+        flush=True,
+    )
+    get_error: BaseException | None = None
+    try:
+        fetched = calendar_client.get_event(calendar_id, event_id)
+        fetched_id = str(fetched.get("id") or "").strip()
+        if fetched_id != event_id:
+            raise RuntimeError(
+                f"calendar get returned a different event id ({fetched_id!r} != {event_id!r})"
+            )
+        print("calendar test API confirms event exists", flush=True)
+    except RuntimeError as exc:
+        get_error = exc
+        print(f"calendar test API get failed: {exc}", flush=True)
+
+    should_wait = (not bool(getattr(args, "yes", False))) if wait_confirm is None else wait_confirm
+    if should_wait:
+        print(f"Look in Google Calendar for: {TEST_CALENDAR_SUMMARY}", flush=True)
+        print(f"  when: {start_label}", flush=True)
+        if html_link:
+            print(f"  link: {html_link}", flush=True)
+        print(
+            "Press Enter when you see it (Ctrl-C leaves the event on the calendar).",
+            flush=True,
+        )
+        try:
+            waiter = confirm_fn if confirm_fn is not None else input
+            waiter()
+        except EOFError as exc:
+            raise SystemExit(
+                f"no TTY to wait for confirm; re-run with --yes or interactively. "
+                f"left dummy event: {html_link or event_id}"
+            ) from exc
+        except KeyboardInterrupt as exc:
+            raise SystemExit(
+                f"left dummy event on the calendar: {html_link or event_id}"
+            ) from exc
+    elif get_error is not None:
+        try:
+            calendar_client.delete_event(calendar_id, event_id)
+        except Exception:
+            pass
+        raise get_error
+
+    try:
+        calendar_client.delete_event(calendar_id, event_id)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"inserted {html_link or event_id} but delete failed: {exc}. "
+            "Delete the dummy event in Google Calendar."
+        ) from exc
+    sleeper = time.sleep if sleep_fn is None else sleep_fn
+    attempts = max(1, int(delete_retries))
+    delay = max(0.0, float(delete_retry_seconds))
+    last_status = ""
+    for attempt in range(attempts):
+        try:
+            fetched = calendar_client.get_event(calendar_id, event_id)
+        except RuntimeError as exc:
+            if calendar_error_is_missing(exc):
+                print("calendar test deleted dummy event", flush=True)
+                return 0
+            raise
+        if calendar_event_is_deleted(fetched):
+            print("calendar test deleted dummy event", flush=True)
+            return 0
+        last_status = str(fetched.get("status") or "confirmed")
+        if attempt + 1 < attempts and delay:
+            sleeper(delay)
+    raise RuntimeError(
+        f"delete reported success but event still exists ({last_status}): {html_link or event_id}"
+    )
 
 
 def verify_calendar_configuration(args: argparse.Namespace) -> tuple[CalendarMatchCache, Any, dict[str, Any]]:
@@ -3328,8 +3705,21 @@ def maybe_add_calendar_event_for_new_market(
 
 
 def verify_email_configuration(args: argparse.Namespace) -> str:
-    """Fail fast and return the Gmail app password for this process."""
-    return load_google_password(args.google_password_file)
+    """Fail fast and return the SMTP password; fill host/user from the selected provider."""
+    profile = apply_email_provider(args)
+    path = resolve_smtp_credentials_path(args)
+    creds = load_smtp_credentials(path, provider=profile.id)
+    username = (
+        str(getattr(args, "smtp_auth_user", "") or "").strip()
+        or creds.username
+        or profile.default_auth_user
+    )
+    if not username:
+        raise RuntimeError(
+            f"SMTP username missing: set SMTP_USERNAME in {path} or pass --smtp-auth-user"
+        )
+    args.smtp_auth_user = username
+    return creds.password
 
 
 def send_new_market_email(
@@ -3343,7 +3733,7 @@ def send_new_market_email(
     password: str,
     verbose: bool,
 ) -> None:
-    """Send one parent-event overview through the configured swaks/Gmail setup."""
+    """Send one parent-event overview through the configured swaks SMTP setup."""
     ticker = str(event.get("event_ticker") or "new mention market")
     run_swaks_email(
         recipient=recipient,
@@ -3379,10 +3769,18 @@ def send_test_email(args: argparse.Namespace) -> int:
             f"Sent: {format_local_time(now, local_tz)}\n"
             "Sample Kalshi market link:\n"
             "https://kalshi.com/markets/kxearningsmentionccl/what-will-carnival-cruise-say-during-their-next-earnings-call/kxearningsmentionccl-26jun23\n\n"
-            "This confirms --email-new can use ~/.config/.google-password and swaks."
+            "This confirms --email-new SMTP via ~/.config/mention-scout/email.json and swaks."
         ),
     )
-    print(f"test email sent to {args.email_to}", flush=True)
+    print(
+        f"test email sent to {args.email_to} from {args.email_from} via {args.smtp_server}",
+        flush=True,
+    )
+    print(
+        'Search Gmail for: from:ryangrimm.net subject:"mention scout SMTP test" '
+        "(also Spam / Promotions). SMTP2GO Activity shows if Gmail accepted or bounced it.",
+        flush=True,
+    )
     return 0
 
 
@@ -3880,20 +4278,47 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "With --watch-new, email one concise parent-event overview through swaks "
-            "for every newly discovered market. Fails fast unless ~/.config/.google-password "
-            "defines GOOGLE_PASSWORD."
+            "for every newly discovered market. Provider comes from ~/.config/mention-scout/email.json "
+            "(default google if missing). smtp2go uses ~/.config/mention-scout/smtp."
         ),
     )
     parser.add_argument(
         "--test-email",
         action="store_true",
-        help="Source the Google password file, send one SMTP test email, then exit",
+        help="Source SMTP credentials for the selected provider, send one test email, then exit",
+    )
+    parser.add_argument(
+        "--test-calendar",
+        action="store_true",
+        help="Insert a dummy Google Calendar event at today 12:00, wait until you confirm you see it, then delete it",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="With --test-calendar, delete after API confirm without waiting for Enter",
+    )
+    parser.add_argument(
+        "--email-config",
+        type=Path,
+        default=DEFAULT_EMAIL_CONFIG_FILE,
+        help="JSON email.json with provider google or smtp2go; missing file defaults to google",
+    )
+    parser.add_argument(
+        "--email-provider",
+        default="",
+        help="Override email.json: google or smtp2go",
+    )
+    parser.add_argument(
+        "--smtp-credentials",
+        type=Path,
+        default=DEFAULT_SMTP_CREDENTIALS_FILE,
+        help="SMTP2GO zsh/sh file (SMTP_USERNAME / SMTP_PASSWORD)",
     )
     parser.add_argument(
         "--google-password-file",
         type=Path,
         default=DEFAULT_GOOGLE_PASSWORD_FILE,
-        help="zsh file sourced for GOOGLE_PASSWORD by --email-new and --test-email",
+        help="Google/Gmail credential file (GOOGLE_PASSWORD) used when provider is google",
     )
     parser.add_argument(
         "--email-to",
@@ -3902,18 +4327,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--email-from",
-        default="ryan.grimm@gmail.com",
-        help="Envelope/header sender used by --email-new",
+        default="",
+        help="Envelope/header sender; default from email.json from, else ryan@ryangrimm.net (smtp2go) or ryan.grimm@gmail.com (google)",
     )
     parser.add_argument(
         "--smtp-server",
-        default="smtp.gmail.com:587",
-        help="swaks SMTP server used by --email-new",
+        default="",
+        help="swaks SMTP host:port; default from email provider (google: smtp.gmail.com:587, smtp2go: mail.smtp2go.com:2525)",
     )
     parser.add_argument(
         "--smtp-auth-user",
-        default="ryan.grimm@gmail.com",
-        help="swaks SMTP auth user used by --email-new",
+        default="",
+        help="swaks SMTP auth user; default is SMTP_USERNAME (smtp2go) or ryan.grimm@gmail.com (google)",
     )
     parser.add_argument(
         "--calendar-add-new",
@@ -4117,6 +4542,8 @@ def main() -> int:
         )
     if dry_run_set and not add_mode:
         raise SystemExit("--dry-run is only valid together with --add-calendar-match")
+    if bool(getattr(args, "yes", False)) and not args.test_calendar:
+        raise SystemExit("--yes is only valid together with --test-calendar")
     if email_on_fail_explicit and not audit_mode:
         raise SystemExit(
             "--email-on-fail/--no-email-on-fail are only valid together with "
@@ -4134,6 +4561,7 @@ def main() -> int:
             ("--email-new", args.email_new),
             ("--queue-initialized", args.queue_initialized),
             ("--test-email", args.test_email),
+            ("--test-calendar", args.test_calendar),
             ("--calendar-add-new", args.calendar_add_new),
             ("--calendar-auth", args.calendar_auth),
             ("--invite-email", bool(args.invite_emails)),
@@ -4165,6 +4593,7 @@ def main() -> int:
                 ("--email-new", args.email_new),
                 ("--queue-initialized", args.queue_initialized),
                 ("--test-email", args.test_email),
+                ("--test-calendar", args.test_calendar),
                 ("--calendar-add-new", args.calendar_add_new),
             )
             if enabled
@@ -4178,15 +4607,31 @@ def main() -> int:
             raise SystemExit("--calendar-duration-minutes must be greater than zero")
         return run_calendar_auth(args)
     if args.test_email:
-        if args.watch_new or args.email_new or args.queue_initialized or args.calendar_add_new:
+        if (
+            args.watch_new
+            or args.email_new
+            or args.queue_initialized
+            or args.calendar_add_new
+            or args.test_calendar
+        ):
             raise SystemExit(
                 "--test-email sends once and cannot be combined with --watch-new, "
-                "--email-new, --queue-initialized, or --calendar-add-new"
+                "--email-new, --queue-initialized, --calendar-add-new, or --test-calendar"
             )
         try:
             return send_test_email(args)
         except RuntimeError as exc:
             raise SystemExit(f"email test failed: {exc}") from exc
+    if args.test_calendar:
+        if args.watch_new or args.email_new or args.queue_initialized or args.calendar_add_new:
+            raise SystemExit(
+                "--test-calendar is a one-shot command and cannot be combined with "
+                "--watch-new, --email-new, --queue-initialized, or --calendar-add-new"
+            )
+        try:
+            return send_test_calendar(args)
+        except RuntimeError as exc:
+            raise SystemExit(f"calendar test failed: {exc}") from exc
     if args.email_new and not args.watch_new:
         raise SystemExit("--email-new is only valid together with --watch-new")
     if args.watch_seen_file is not None and not args.watch_new:

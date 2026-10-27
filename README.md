@@ -20,6 +20,14 @@ If you already have the repo checked out:
 
 Requirements: **Python 3** (stdlib only). No `pip install` for basic discovery.
 
+Optional editable install (puts `mention-scout` and `mention-markets` on `PATH`):
+
+```bash
+python3 -m pip install -e .
+python3 -m pip install -e '.[calendar]'   # Google Calendar extra
+mention-scout --overview
+```
+
 ## Common commands
 
 ```bash
@@ -46,7 +54,7 @@ Requirements: **Python 3** (stdlib only). No `pip install` for basic discovery.
 # Watch for newly created parent events (Ctrl-C to stop)
 ./mention_scout.py --watch-new
 
-# Watch + email on each new parent event (needs swaks + Gmail app password)
+# Watch + email on each new parent event (needs swaks + SMTP2GO credentials)
 ./mention_scout.py --watch-new --email-new
 
 # Watch + auto-add phrase-matched new parents to Google Calendar (MS-0010)
@@ -75,24 +83,37 @@ New-market email subjects look like:
 
 ## Email setup (optional)
 
-Used only by `--email-new` / `--test-email`.
+Used only by `--email-new` / `--test-email`. Provider is selected by `~/.config/mention-scout/email.json`. **If that file is missing, the scout keeps the old Google/Gmail setup** (`smtp.gmail.com:587` + `~/.config/.google-password`).
 
-1. Install [swaks](https://www.jetmore.org/john/code/swaks/) and put it on `PATH`.
-2. Create `~/.config/.google-password` (mode `600`) with a Gmail app password:
+### Google (default / existing hosts)
 
 ```bash
 # ~/.config/.google-password
-GOOGLE_PASSWORD='your-app-password'
+GOOGLE_PASSWORD='your-gmail-app-password'
 chmod 600 ~/.config/.google-password
-```
-
-3. Prove SMTP:
-
-```bash
 ./mention_scout.py --test-email
 ```
 
-The password file is sourced, never printed or cached by the scout.
+### SMTP2GO (new hosts)
+
+```bash
+mkdir -p ~/.config/mention-scout
+cp deploy/config/email.example.json ~/.config/mention-scout/email.json
+cat > ~/.config/mention-scout/smtp <<'SMTP'
+SMTP_USERNAME='your-smtp2go-username'
+SMTP_PASSWORD='your-smtp2go-password'
+SMTP
+chmod 600 ~/.config/mention-scout/smtp ~/.config/mention-scout/email.json
+```
+
+Install [swaks](https://www.jetmore.org/john/code/swaks/) on `PATH`, then prove SMTP (sends one message and exits):
+
+```bash
+./mention_scout.py --test-email
+./mention_scout.py --test-email --email-to you@example.com --email-from you@example.com
+```
+
+`--email-provider google|smtp2go` overrides the JSON. Credentials are sourced, never printed. SMTP2GO `--email-from` defaults to `ryan@ryangrimm.net` (verified domain). Override with `"from"` in `email.json` or `--email-from`. `--email-to` can stay Gmail.
 
 ## Google Calendar auto-add (optional)
 
@@ -145,7 +166,7 @@ After hand-edits, validate without starting watch:
 
 - **Success:** stdout summary (`phrases` count, optional `default_time`), exit 0, **no email**.
 - **Failure:** non-zero exit + stderr detail; by default attempts one FAIL email with subject
-  `[Kalshi] FAIL | calendar-matches audit` when SMTP/`~/.config/.google-password` is loadable.
+  `[Kalshi] FAIL | calendar-matches audit` when SMTP/`~/.config/mention-scout/smtp` is loadable.
   Use `--no-email-on-fail` for cron/CI-style checks without mail.
 - This is **config hygiene**. It is separate from **MS-0012** watch-startup FAIL mail
   (`[Kalshi] FAIL | mention-scout start`, when that ships): different trigger, subject, and body focus.
@@ -196,7 +217,8 @@ Prefer the helper over hand-editing JSON when adding/updating one phrase:
 4. Install optional libraries (core scout stays stdlib-only without calendar):
 
 ```bash
-python3 -m pip install --user google-auth google-auth-oauthlib google-api-python-client
+python3 -m pip install -e '.[calendar]'
+# or: python3 -m pip install --user google-auth google-auth-oauthlib google-api-python-client
 ```
 
 5. Run one-shot browser consent (not inside systemd):
@@ -206,6 +228,14 @@ python3 -m pip install --user google-auth google-auth-oauthlib google-api-python
 ```
 
 This writes `~/.config/mention-scout/token.json` (mode `600`). Headless `--watch-new --calendar-add-new` **never** opens a browser; missing/invalid secret, token, or match file fails fast at watch start.
+
+Prove Calendar insert/delete (dummy event at **today 12:00** in `--timezone`):
+
+```bash
+./mention_scout.py --test-calendar
+```
+
+Inserts, prints the event link, then **waits for Enter** after you see it on Google Calendar, then deletes it. Ctrl-C leaves the dummy event. `--yes` skips the wait (API confirm + delete). Does not write `calendar-added.json`. Needs `client_secret.json` + `token.json`.
 
 ### 3. Run watch with calendar
 
@@ -312,7 +342,7 @@ For unattended `--watch-new` (optionally with email) under **user** systemd — 
 
 - Python 3 on `PATH` (installer records an absolute interpreter path)
 - A git checkout that contains `./mention_scout.py`
-- For email alerts (default in the generated unit): `swaks` on `PATH` and `~/.config/.google-password` (mode `600`) — same as interactive `--email-new`
+- For email alerts (default in the generated unit): `swaks` on `PATH` plus Google (`~/.config/.google-password`) or SMTP2GO (`email.json` + `smtp`) — same as interactive `--email-new`
 - A working user systemd session (`systemctl --user`)
 
 ### Install (one-liner)
@@ -376,7 +406,7 @@ Uninstall disables the unit, removes `~/.config/systemd/user/mention-scout-watch
 
 ### Ops caution (email noise)
 
-Unattended `--email-new` can mail on every newly seen parent event. If classification is noisy, prefer `--no-email` until you are happy with interactive watch output. No secrets are written into the unit file; the app still loads `~/.config/.google-password` at runtime.
+Unattended `--email-new` can mail on every newly seen parent event. If classification is noisy, prefer `--no-email` until you are happy with interactive watch output. No secrets are written into the unit file; the app loads `~/.config/mention-scout/email.json` and the matching credential file at runtime.
 
 ### Template location
 
