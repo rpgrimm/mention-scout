@@ -46,7 +46,7 @@ Requirements: **Python 3** (stdlib only). No `pip install` for basic discovery.
 # Watch for newly created parent events (Ctrl-C to stop)
 ./mention_scout.py --watch-new
 
-# Watch + email on each new parent event (needs swaks + Gmail app password)
+# Watch + email on each new parent event (needs swaks + SMTP2GO credentials)
 ./mention_scout.py --watch-new --email-new
 
 # Watch + auto-add phrase-matched new parents to Google Calendar (MS-0010)
@@ -75,24 +75,28 @@ New-market email subjects look like:
 
 ## Email setup (optional)
 
-Used only by `--email-new` / `--test-email`.
+Used only by `--email-new` / `--test-email`. Default SMTP is **SMTP2GO** `mail.smtp2go.com:2525`.
 
 1. Install [swaks](https://www.jetmore.org/john/code/swaks/) and put it on `PATH`.
-2. Create `~/.config/.google-password` (mode `600`) with a Gmail app password:
+2. Create `~/.config/mention-scout/smtp` (mode `600`) with the SMTP2GO username and password:
 
 ```bash
-# ~/.config/.google-password
-GOOGLE_PASSWORD='your-app-password'
-chmod 600 ~/.config/.google-password
+mkdir -p ~/.config/mention-scout
+cat > ~/.config/mention-scout/smtp <<'EOF'
+SMTP_USERNAME='your-smtp2go-username'
+SMTP_PASSWORD='your-smtp2go-password'
+EOF
+chmod 600 ~/.config/mention-scout/smtp
 ```
 
-3. Prove SMTP:
+3. Prove SMTP (sends one message to the default `--email-to` and exits):
 
 ```bash
 ./mention_scout.py --test-email
+./mention_scout.py --test-email --email-to you@example.com --email-from you@example.com
 ```
 
-The password file is sourced, never printed or cached by the scout.
+The credentials file is sourced, never printed or cached by the scout. Override host/port with `--smtp-server host:port`. Legacy `~/.config/.google-password` (`GOOGLE_PASSWORD=...`) is still used if the smtp file is missing.
 
 ## Google Calendar auto-add (optional)
 
@@ -145,7 +149,7 @@ After hand-edits, validate without starting watch:
 
 - **Success:** stdout summary (`phrases` count, optional `default_time`), exit 0, **no email**.
 - **Failure:** non-zero exit + stderr detail; by default attempts one FAIL email with subject
-  `[Kalshi] FAIL | calendar-matches audit` when SMTP/`~/.config/.google-password` is loadable.
+  `[Kalshi] FAIL | calendar-matches audit` when SMTP/`~/.config/mention-scout/smtp` is loadable.
   Use `--no-email-on-fail` for cron/CI-style checks without mail.
 - This is **config hygiene**. It is separate from **MS-0012** watch-startup FAIL mail
   (`[Kalshi] FAIL | mention-scout start`, when that ships): different trigger, subject, and body focus.
@@ -312,7 +316,7 @@ For unattended `--watch-new` (optionally with email) under **user** systemd — 
 
 - Python 3 on `PATH` (installer records an absolute interpreter path)
 - A git checkout that contains `./mention_scout.py`
-- For email alerts (default in the generated unit): `swaks` on `PATH` and `~/.config/.google-password` (mode `600`) — same as interactive `--email-new`
+- For email alerts (default in the generated unit): `swaks` on `PATH` and `~/.config/mention-scout/smtp` (mode `600`) — same as interactive `--email-new`
 - A working user systemd session (`systemctl --user`)
 
 ### Install (one-liner)
@@ -376,7 +380,7 @@ Uninstall disables the unit, removes `~/.config/systemd/user/mention-scout-watch
 
 ### Ops caution (email noise)
 
-Unattended `--email-new` can mail on every newly seen parent event. If classification is noisy, prefer `--no-email` until you are happy with interactive watch output. No secrets are written into the unit file; the app still loads `~/.config/.google-password` at runtime.
+Unattended `--email-new` can mail on every newly seen parent event. If classification is noisy, prefer `--no-email` until you are happy with interactive watch output. No secrets are written into the unit file; the app still loads `~/.config/mention-scout/smtp` at runtime.
 
 ### Template location
 

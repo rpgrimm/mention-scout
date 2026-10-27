@@ -40,6 +40,13 @@ Changes in v10:
   * Bumps the cache format so a v9 compact cache is rebuilt once with the
     corrected query-status marker.
 
+Changes in v16.5 / MS-0020:
+  * Default SMTP is SMTP2GO ``mail.smtp2go.com:2525`` (STARTTLS via swaks ``--tls``).
+  * Username and password come from ``~/.config/mention-scout/smtp``
+    (``SMTP_USERNAME`` / ``SMTP_PASSWORD``, mode 600). ``--test-email`` still
+    sends one message and exits. Legacy ``~/.config/.google-password`` remains
+    a fallback if the new file is missing.
+
 Changes in v16.4 / MS-0018:
   * --watch-new persists seen parent event tickers under
     $XDG_STATE_HOME/mention-scout/seen-event-tickers.json (default
@@ -138,7 +145,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-VERSION = "16.4.0"
+VERSION = "16.5.0"
 CACHE_FORMAT_VERSION = 5
 DEFAULT_MENTION_CACHE_FILE = ".kalshi_mention_scout_mentions_cache.json"
 DEFAULT_FULL_CACHE_FILE = ".kalshi_mention_scout_full_cache.json"
@@ -148,6 +155,8 @@ QUEUE_FORMAT_VERSION = 1
 WATCH_SEEN_FILE_VERSION = 2
 DEFAULT_GOOGLE_PASSWORD_FILE = Path("~/.config/.google-password")
 DEFAULT_MENTION_SCOUT_CONFIG_DIR = Path("~/.config/mention-scout")
+DEFAULT_SMTP_CREDENTIALS_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "smtp"
+DEFAULT_SMTP_SERVER = "mail.smtp2go.com:2525"
 DEFAULT_CALENDAR_MATCHES_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "calendar-matches.json"
 DEFAULT_CALENDAR_CLIENT_SECRET_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "client_secret.json"
 DEFAULT_CALENDAR_TOKEN_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "token.json"
@@ -1590,6 +1599,7 @@ def _watch_child_arguments(original_argv: list[str]) -> list[str]:
         "--queue-dir",
         "--watch-seen-file",
         "--google-password-file",
+        "--smtp-credentials",
         "--calendar-matches",
         "--calendar-client-secret",
         "--calendar-token",
@@ -1731,76 +1741,95 @@ def format_overview_email(event: dict[str, Any], detected_at: datetime, local_tz
     return "\n".join(lines)
 
 
-def load_google_password(password_file: Path) -> str:
-    """Source a zsh credential file and return its GOOGLE_PASSWORD value.
+@dataclass(frozen=True)
+class SmtpCredentials:
+    """SMTP auth values sourced from a local 600-mode file. Never logged."""
 
-    The file is intentionally sourced rather than parsed as JSON or dotenv so
-    either ``GOOGLE_PASSWORD=...`` or ``export GOOGLE_PASSWORD=...`` works.
-    It is never printed, cached, or placed in the scout's own environment.
+    username: str
+    password: str
+
+
+def resolve_smtp_credentials_path(args: argparse.Namespace) -> Path:
+    """Prefer ~/.config/mention-scout/smtp; fall back to legacy Google password file."""
+    smtp_path = Path(getattr(args, "smtp_credentials", DEFAULT_SMTP_CREDENTIALS_FILE)).expanduser()
+    google_path = Path(
+        getattr(args, "google_password_file", DEFAULT_GOOGLE_PASSWORD_FILE)
+    ).expanduser()
+    if smtp_path.exists():
+        return smtp_path
+    if google_path.exists():
+        return google_path
+    return smtp_path
+
+
+def load_smtp_credentials(credentials_file: Path) -> SmtpCredentials:
+    """Source a zsh/sh credential file and return SMTP username + password.
+
+    Recognizes ``SMTP_USERNAME`` / ``SMTP_USER`` / ``SMTP_AUTH_USER`` and
+    ``SMTP_PASSWORD`` / ``GOOGLE_PASSWORD``. The file is sourced rather than
+    parsed as JSON so ordinary shell assignments work. Values are never printed,
+    cached, or placed in the scout's own environment.
     """
-    path = password_file.expanduser()
+    path = credentials_file.expanduser()
     try:
         stat = path.stat()
     except FileNotFoundError as exc:
         raise RuntimeError(
-            f"Google password file is missing: {path}. "
-            "Create it with GOOGLE_PASSWORD='your Gmail app password' and chmod 600 it."
+            f"SMTP credentials file is missing: {path}. "
+            "Create it with SMTP_USERNAME=... and SMTP_PASSWORD=... and chmod 600 it."
         ) from exc
     except OSError as exc:
-        raise RuntimeError(f"Cannot read Google password file {path}: {exc}") from exc
+        raise RuntimeError(f"Cannot read SMTP credentials file {path}: {exc}") from exc
 
     if not path.is_file():
-        raise RuntimeError(f"Google password path is not a regular file: {path}")
+        raise RuntimeError(f"SMTP credentials path is not a regular file: {path}")
     if stat.st_mode & 0o077:
         raise RuntimeError(
-            f"Google password file permissions are too broad: {path} "
-            "(run: chmod 600 ~/.config/.google-password)"
+            f"SMTP credentials file permissions are too broad: {path} "
+            f"(run: chmod 600 {path})"
         )
 
-    # zsh is preferred because it matches the user's shell; -f skips startup
-    # files. A POSIX sh fallback supports ordinary GOOGLE_PASSWORD=... files on
-    # hosts that do not have zsh installed.
+    extract = (
+        r'printf "%s\n%s" '
+        r'"${SMTP_USERNAME:-${SMTP_USER:-${SMTP_AUTH_USER-}}}" '
+        r'"${SMTP_PASSWORD:-${GOOGLE_PASSWORD-}}"'
+    )
     commands = [
-        [
-            "zsh",
-            "-f",
-            "-c",
-            'source "$1" >/dev/null; print -rn -- "${GOOGLE_PASSWORD-}"',
-            "kalshi-google-password-loader",
-            str(path),
-        ],
-        [
-            "/bin/sh",
-            "-c",
-            '. "$1" >/dev/null; printf "%s" "${GOOGLE_PASSWORD-}"',
-            "kalshi-google-password-loader",
-            str(path),
-        ],
+        ["zsh", "-f", "-c", f'source "$1" >/dev/null; {extract}', "mention-scout-smtp-loader", str(path)],
+        ["/bin/sh", "-c", f'. "$1" >/dev/null; {extract}', "mention-scout-smtp-loader", str(path)],
     ]
     completed: subprocess.CompletedProcess[str] | None = None
-    missing_shells = 0
     for command in commands:
         try:
             completed = subprocess.run(command, text=True, capture_output=True, check=False)
             break
         except FileNotFoundError:
-            missing_shells += 1
+            continue
         except OSError as exc:
-            raise RuntimeError(f"Could not source Google password file {path}: {exc}") from exc
+            raise RuntimeError(f"Could not source SMTP credentials file {path}: {exc}") from exc
 
     if completed is None:
-        raise RuntimeError("Neither zsh nor /bin/sh was available to source ~/.config/.google-password")
+        raise RuntimeError("Neither zsh nor /bin/sh was available to source SMTP credentials")
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or f"exit {completed.returncode}").strip()
-        raise RuntimeError(f"Could not source Google password file {path}: {detail[:600]}")
+        raise RuntimeError(f"Could not source SMTP credentials file {path}: {detail[:600]}")
 
-    password = completed.stdout
+    raw = completed.stdout or ""
+    username, sep, password = raw.partition("\n")
+    if not sep:
+        username, password = "", raw
+    username = username.strip()
     if not password:
         raise RuntimeError(
-            f"GOOGLE_PASSWORD was not set by {path}. "
-            "Set GOOGLE_PASSWORD='your Gmail app password' in that file."
+            f"SMTP_PASSWORD was not set by {path}. "
+            "Set SMTP_PASSWORD='...' (or GOOGLE_PASSWORD for the legacy file) in that file."
         )
-    return password
+    return SmtpCredentials(username=username, password=password)
+
+
+def load_google_password(password_file: Path) -> str:
+    """Legacy helper: source a credential file and return the password only."""
+    return load_smtp_credentials(password_file).password
 
 
 def run_swaks_email(
@@ -1813,7 +1842,7 @@ def run_swaks_email(
     subject: str,
     body: str,
 ) -> None:
-    """Send one plain-text Gmail SMTP message using the user's swaks setup."""
+    """Send one plain-text SMTP message using the user's swaks setup."""
     command = [
         "swaks",
         "--to", recipient,
@@ -3328,8 +3357,16 @@ def maybe_add_calendar_event_for_new_market(
 
 
 def verify_email_configuration(args: argparse.Namespace) -> str:
-    """Fail fast and return the Gmail app password for this process."""
-    return load_google_password(args.google_password_file)
+    """Fail fast and return the SMTP password; fill smtp_auth_user from the file if needed."""
+    path = resolve_smtp_credentials_path(args)
+    creds = load_smtp_credentials(path)
+    username = str(getattr(args, "smtp_auth_user", "") or "").strip() or creds.username
+    if not username:
+        raise RuntimeError(
+            f"SMTP username missing: set SMTP_USERNAME in {path} or pass --smtp-auth-user"
+        )
+    args.smtp_auth_user = username
+    return creds.password
 
 
 def send_new_market_email(
@@ -3343,7 +3380,7 @@ def send_new_market_email(
     password: str,
     verbose: bool,
 ) -> None:
-    """Send one parent-event overview through the configured swaks/Gmail setup."""
+    """Send one parent-event overview through the configured swaks SMTP setup."""
     ticker = str(event.get("event_ticker") or "new mention market")
     run_swaks_email(
         recipient=recipient,
@@ -3379,7 +3416,7 @@ def send_test_email(args: argparse.Namespace) -> int:
             f"Sent: {format_local_time(now, local_tz)}\n"
             "Sample Kalshi market link:\n"
             "https://kalshi.com/markets/kxearningsmentionccl/what-will-carnival-cruise-say-during-their-next-earnings-call/kxearningsmentionccl-26jun23\n\n"
-            "This confirms --email-new can use ~/.config/.google-password and swaks."
+            "This confirms --email-new can use ~/.config/mention-scout/smtp and swaks."
         ),
     )
     print(f"test email sent to {args.email_to}", flush=True)
@@ -3880,20 +3917,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "With --watch-new, email one concise parent-event overview through swaks "
-            "for every newly discovered market. Fails fast unless ~/.config/.google-password "
-            "defines GOOGLE_PASSWORD."
+            "for every newly discovered market. Fails fast unless ~/.config/mention-scout/smtp "
+            "defines SMTP_USERNAME and SMTP_PASSWORD (legacy ~/.config/.google-password still works)."
         ),
     )
     parser.add_argument(
         "--test-email",
         action="store_true",
-        help="Source the Google password file, send one SMTP test email, then exit",
+        help="Source SMTP credentials, send one test email, then exit",
+    )
+    parser.add_argument(
+        "--smtp-credentials",
+        type=Path,
+        default=DEFAULT_SMTP_CREDENTIALS_FILE,
+        help="zsh/sh file sourced for SMTP_USERNAME and SMTP_PASSWORD by --email-new and --test-email",
     )
     parser.add_argument(
         "--google-password-file",
         type=Path,
         default=DEFAULT_GOOGLE_PASSWORD_FILE,
-        help="zsh file sourced for GOOGLE_PASSWORD by --email-new and --test-email",
+        help="Legacy credential file (GOOGLE_PASSWORD) used if --smtp-credentials is missing",
     )
     parser.add_argument(
         "--email-to",
@@ -3907,13 +3950,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--smtp-server",
-        default="smtp.gmail.com:587",
-        help="swaks SMTP server used by --email-new",
+        default=DEFAULT_SMTP_SERVER,
+        help="swaks SMTP host:port used by --email-new (default: SMTP2GO mail.smtp2go.com:2525)",
     )
     parser.add_argument(
         "--smtp-auth-user",
-        default="ryan.grimm@gmail.com",
-        help="swaks SMTP auth user used by --email-new",
+        default="",
+        help="swaks SMTP auth user; default is SMTP_USERNAME from --smtp-credentials",
     )
     parser.add_argument(
         "--calendar-add-new",

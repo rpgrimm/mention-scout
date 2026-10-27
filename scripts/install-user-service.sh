@@ -232,7 +232,15 @@ XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 UNIT_DIR="${XDG_CONFIG_HOME}/systemd/user"
 UNIT_PATH="${UNIT_DIR}/${UNIT_NAME}"
 
-PASSWORD_FILE="${HOME}/.config/.google-password"
+SMTP_FILE="${HOME}/.config/mention-scout/smtp"
+GOOGLE_PASSWORD_FILE="${HOME}/.config/.google-password"
+if [[ -f "$SMTP_FILE" ]]; then
+  PASSWORD_FILE="$SMTP_FILE"
+elif [[ -f "$GOOGLE_PASSWORD_FILE" ]]; then
+  PASSWORD_FILE="$GOOGLE_PASSWORD_FILE"
+else
+  PASSWORD_FILE="$SMTP_FILE"
+fi
 
 shell_join_exec() {
   # Produce a single ExecStart line with shell-safe quoting.
