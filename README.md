@@ -81,7 +81,7 @@ Used only by `--email-new` / `--test-email`. Provider is selected by `~/.config/
 
 ```bash
 # ~/.config/.google-password
-GOOGLE_PASSWORD='***'
+GOOGLE_PASSWORD='your-gmail-app-password'
 chmod 600 ~/.config/.google-password
 ./mention_scout.py --test-email
 ```
@@ -93,7 +93,7 @@ mkdir -p ~/.config/mention-scout
 cp deploy/config/email.example.json ~/.config/mention-scout/email.json
 cat > ~/.config/mention-scout/smtp <<'SMTP'
 SMTP_USERNAME='your-smtp2go-username'
-SMTP_PASSWORD='***'
+SMTP_PASSWORD='your-smtp2go-password'
 SMTP
 chmod 600 ~/.config/mention-scout/smtp ~/.config/mention-scout/email.json
 ```
@@ -105,7 +105,7 @@ Install [swaks](https://www.jetmore.org/john/code/swaks/) on `PATH`, then prove 
 ./mention_scout.py --test-email --email-to you@example.com --email-from you@example.com
 ```
 
-`--email-provider google|smtp2go` overrides the JSON. Credentials are sourced, never printed.
+`--email-provider google|smtp2go` overrides the JSON. Credentials are sourced, never printed. SMTP2GO requires `--email-from` to be a **Verified Sender** (domain or single email in the SMTP2GO dashboard); `ryan.grimm@gmail.com` only works if that exact address is verified.
 
 ## Google Calendar auto-add (optional)
 

@@ -177,6 +177,30 @@ def test_test_email_smtp2go(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert sent["subject"] == "[Kalshi] mention scout SMTP test"
 
 
+def test_format_swaks_failure_keeps_the_end_not_the_banner() -> None:
+    banner = "=== Trying mail.smtp2go.com:2525...\n" + ("<-  250-STARTTLS\n" * 80)
+    detail = banner + "<-  535 Incorrect authentication data\n*** No authentication was successful"
+    text = scout.format_swaks_failure(detail, sender="ryan.grimm@gmail.com")
+    assert "535" in text
+    assert "SMTP Users" in text
+    assert text.startswith("swaks failed:")
+
+
+def test_format_swaks_failure_hints_verified_sender() -> None:
+    detail = "<-  550 The from address does not match a verified Sender Identity"
+    text = scout.format_swaks_failure(detail, sender="ryan.grimm@gmail.com")
+    assert "Verified Senders" in text
+    assert "ryan.grimm@gmail.com" in text
+
+
+def test_redact_swaks_auth_payloads() -> None:
+    raw = " -> AUTH LOGIN\n -> dXNlcm5hbWU=\n -> cGFzc3dvcmQ=\n<-  235 OK"
+    text = scout._redact_swaks_transcript(raw)
+    assert "dXNlcm5hbWU=" not in text
+    assert "cGFzc3dvcmQ=" not in text
+    assert "[redacted]" in text
+
+
 def test_password_file_mode_is_600(tmp_path: Path) -> None:
     path = _write_creds(tmp_path / "smtp", "SMTP_USERNAME='u'\nSMTP_PASSWORD='p'\n")
     assert stat.S_IMODE(path.stat().st_mode) == 0o600

@@ -1926,6 +1926,42 @@ def load_google_password(password_file: Path) -> str:
     return load_smtp_credentials(password_file, provider="google").password
 
 
+def _redact_swaks_transcript(text: str) -> str:
+    """Drop AUTH payloads from a swaks transcript so failures can be shown."""
+    lines: list[str] = []
+    redact_remaining = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        upper = stripped.upper()
+        if "AUTH LOGIN" in upper or "AUTH PLAIN" in upper:
+            lines.append(line)
+            redact_remaining = 2 if "LOGIN" in upper else 1
+            continue
+        if redact_remaining and (stripped.startswith("->") or stripped.startswith("~>")):
+            lines.append(" -> [redacted]")
+            redact_remaining -= 1
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def format_swaks_failure(detail: str, *, sender: str = "") -> str:
+    """Keep the end of the SMTP transcript (where the failure is) plus a short hint."""
+    transcript = _redact_swaks_transcript(detail.strip())
+    if len(transcript) > 1500:
+        transcript = transcript[-1500:]
+    lower = transcript.lower()
+    hint = ""
+    if "535" in transcript or "incorrect authentication" in lower:
+        hint = " SMTP2GO 535: use Sending → SMTP Users (not the dashboard login)."
+    elif "550" in transcript or "verified sender" in lower or "sender identity" in lower:
+        hint = (
+            f" SMTP2GO 550: --email-from {sender!r} must be a verified sender "
+            "(Sending → Verified Senders)."
+        )
+    return f"swaks failed:{hint}\n{transcript}"
+
+
 def run_swaks_email(
     *,
     recipient: str,
@@ -1958,7 +1994,7 @@ def run_swaks_email(
 
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or f"exit {completed.returncode}").strip()
-        raise RuntimeError(f"swaks failed: {detail[:600]}")
+        raise RuntimeError(format_swaks_failure(detail, sender=sender))
 
 
 # ---------------------------------------------------------------------------
