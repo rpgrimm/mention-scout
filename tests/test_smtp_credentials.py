@@ -102,7 +102,7 @@ def test_apply_smtp2go_config_uses_smtp2go_server_and_ryangrimm_from(tmp_path: P
     profile = scout.apply_email_provider(args)
     assert profile.id == "smtp2go"
     assert args.smtp_server == "mail.smtp2go.com:2525"
-    assert args.email_from == "ryan@ryangrimm.net"
+    assert args.email_from == "vern@ryangrimm.net"
 
 
 def test_email_json_from_overrides_smtp2go_default(tmp_path: Path) -> None:

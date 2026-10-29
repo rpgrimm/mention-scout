@@ -40,6 +40,9 @@ Changes in v10:
   * Bumps the cache format so a v9 compact cache is rebuilt once with the
     corrected query-status marker.
 
+Changes in v16.7 / MS-0022:
+  * SMTP2GO default ``--email-from`` is ``vern@ryangrimm.net``.
+
 Changes in v16.6 / MS-0023:
   * User-unit default ExecStart uses ``%h/code/dev/mention-scout/venv/bin/python``
     and ``--watch-new --email-new --calendar-add-new --invite-email cherylr125@gmail.com``.
@@ -153,7 +156,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-VERSION = "16.6.0"
+VERSION = "16.7.0"
 CACHE_FORMAT_VERSION = 5
 DEFAULT_MENTION_CACHE_FILE = ".kalshi_mention_scout_mentions_cache.json"
 DEFAULT_FULL_CACHE_FILE = ".kalshi_mention_scout_full_cache.json"
@@ -169,7 +172,7 @@ DEFAULT_GMAIL_SMTP_SERVER = "smtp.gmail.com:587"
 DEFAULT_SMTP2GO_SERVER = "mail.smtp2go.com:2525"
 DEFAULT_GMAIL_AUTH_USER = "ryan.grimm@gmail.com"
 DEFAULT_GMAIL_FROM = "ryan.grimm@gmail.com"
-DEFAULT_SMTP2GO_FROM = "ryan@ryangrimm.net"
+DEFAULT_SMTP2GO_FROM = "vern@ryangrimm.net"
 DEFAULT_EMAIL_PROVIDER = "google"
 DEFAULT_CALENDAR_MATCHES_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "calendar-matches.json"
 DEFAULT_CALENDAR_CLIENT_SECRET_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "client_secret.json"
@@ -4376,7 +4379,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--email-from",
         default="",
-        help="Envelope/header sender; default from email.json from, else ryan@ryangrimm.net (smtp2go) or ryan.grimm@gmail.com (google)",
+        help="Envelope/header sender; default from email.json from, else vern@ryangrimm.net (smtp2go) or ryan.grimm@gmail.com (google)",
     )
     parser.add_argument(
         "--smtp-server",
