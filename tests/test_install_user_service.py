@@ -13,7 +13,6 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = REPO_ROOT / "scripts" / "install-user-service.sh"
 TEMPLATE = REPO_ROOT / "deploy" / "systemd" / "mention-scout-watch.service"
-STABLE_ENTRY = REPO_ROOT / "mention_scout.py"
 
 
 def _run_installer(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -43,6 +42,8 @@ def test_template_exists_with_placeholders_only() -> None:
     assert "WantedBy=default.target" in text
     assert "--watch-new" in text
     assert "--email-new" in text
+    assert "--calendar-add-new" in text
+    assert "--invite-email cherylr125@gmail.com" in text
     # No host-only home paths or secrets in committed template
     assert "/home/" not in text
     assert "GOOGLE_PASSWORD" not in text
@@ -55,27 +56,36 @@ def test_installer_is_executable() -> None:
     assert mode & stat.S_IXUSR, "install-user-service.sh must be executable"
 
 
-def test_dry_run_default_includes_email_and_absolute_paths() -> None:
+def test_dry_run_default_uses_home_specifier_venv_calendar_and_invite() -> None:
     proc = _run_installer("--dry-run")
     assert proc.returncode == 0, proc.stderr or proc.stdout
     out = proc.stdout
     assert "----- rendered unit (dry-run) -----" in out
-    assert f"WorkingDirectory={REPO_ROOT}" in out
-    assert "--watch-new" in out
-    assert "--email-new" in out
-    # ExecStart should use absolute python + entry
-    assert "ExecStart=" in out
+    assert "WorkingDirectory=%h/code/dev/mention-scout" in out
     exec_lines = [ln for ln in out.splitlines() if ln.startswith("ExecStart=")]
     assert exec_lines, out
     exec_line = exec_lines[0]
-    assert exec_line.startswith("ExecStart=/"), exec_line
-    assert str(STABLE_ENTRY.resolve()) in exec_line or "mention_scout.py" in exec_line
+    assert "%h/code/dev/mention-scout/venv/bin/python" in exec_line, exec_line
+    assert "%h/code/dev/mention-scout/mention_scout.py" in exec_line, exec_line
+    assert "--watch-new" in exec_line
+    assert "--email-new" in exec_line
+    assert "--calendar-add-new" in exec_line
+    assert "--invite-email" in exec_line
+    assert "cherylr125@gmail.com" in exec_line
     assert "@REPO_ROOT@" not in out
     assert "@PYTHON@" not in out
     assert "@ENTRY@" not in out
-    # dry-run must not claim a real write completed without dry-run marker
-    assert f"would write" in out
+    assert "would write" in out
     assert "daemon-reload" in out
+
+
+def test_dry_run_no_calendar_omits_calendar_and_invite() -> None:
+    proc = _run_installer("--dry-run", "--no-calendar")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    exec_lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("ExecStart=")]
+    assert exec_lines
+    assert "--calendar-add-new" not in exec_lines[0]
+    assert "--invite-email" not in exec_lines[0]
 
 
 def test_dry_run_no_email_omits_email_flag() -> None:
@@ -133,7 +143,7 @@ def test_install_to_temp_xdg_without_systemctl(tmp_path: Path, monkeypatch: pyte
     unit_path = xdg / "systemd" / "user" / "mention-scout-watch.service"
     assert unit_path.is_file()
     text = unit_path.read_text(encoding="utf-8")
-    assert f"WorkingDirectory={REPO_ROOT}" in text
+    assert "WorkingDirectory=%h/code/dev/mention-scout" in text
     assert "--watch-new" in text
     assert "--email-new" not in text.split("ExecStart=", 1)[1].splitlines()[0]
     assert "Restart=on-failure" in text

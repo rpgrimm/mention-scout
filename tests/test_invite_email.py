@@ -224,11 +224,15 @@ def test_watch_child_arguments_strips_invite_email() -> None:
             "--invite-email",
             "partner@gmail.com",
             "--invite-email=friend@example.com",
+            "--invite-emails-file",
+            "/tmp/invite-emails.json",
             "--type",
             "wnt",
         ]
     )
     assert "--invite-email" not in child
+    assert "--invite-emails-file" not in child
+    assert "/tmp/invite-emails.json" not in child
     assert "partner@gmail.com" not in child
     assert "friend@example.com" not in child
     assert "--type" in child
@@ -248,6 +252,29 @@ def test_main_invite_without_calendar_add_new_fails() -> None:
             scout.main()
     finally:
         sys.argv = old
+
+
+def test_load_invite_emails_config_missing_is_empty(tmp_path: Path) -> None:
+    assert scout.load_invite_emails_config(tmp_path / "nope.json") == []
+
+
+def test_load_invite_emails_config_object_and_list(tmp_path: Path) -> None:
+    obj = tmp_path / "invite-emails.json"
+    obj.write_text(
+        '{"invite_emails": ["cherylr125@gmail.com", "cherylr125@gmail.com"]}\n',
+        encoding="utf-8",
+    )
+    assert scout.load_invite_emails_config(obj) == ["cherylr125@gmail.com"]
+    arr = tmp_path / "list.json"
+    arr.write_text('["a@b.com", "c@d.com"]\n', encoding="utf-8")
+    assert scout.load_invite_emails_config(arr) == ["a@b.com", "c@d.com"]
+
+
+def test_merge_invite_emails_file_then_cli() -> None:
+    assert scout.merge_invite_emails(
+        ["cherylr125@gmail.com"],
+        ["partner@gmail.com", "cherylr125@gmail.com"],
+    ) == ["cherylr125@gmail.com", "partner@gmail.com"]
 
 
 def test_main_invalid_invite_fails() -> None:

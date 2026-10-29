@@ -10,7 +10,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 WorkingDirectory=@REPO_ROOT@
-ExecStart=@PYTHON@ @ENTRY@ --watch-new --email-new
+ExecStart=@PYTHON@ @ENTRY@ --watch-new --email-new --calendar-add-new --invite-email cherylr125@gmail.com
 Restart=on-failure
 RestartSec=30
 StandardOutput=journal

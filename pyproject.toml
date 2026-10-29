@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mention-scout"
-version = "16.5.0"
+version = "16.6.0"
 description = "Find Kalshi mention markets and optionally watch, email, and add matches to Google Calendar."
 readme = "README.md"
 requires-python = ">=3.10"
