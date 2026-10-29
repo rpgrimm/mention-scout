@@ -249,7 +249,7 @@ Inserts, prints the event link, then **waits for Enter** after you see it on Goo
   --invite-email other@example.com
 ```
 
-`--invite-email` is **repeatable**. Guests are attached as Calendar **attendees** and Google is asked to notify them (`sendUpdates=all`). Mention-scout does **not** SMTP-mail invitees (no swaks fan-out). Requires `--calendar-add-new`. Ops caution: each matched new market can notify external guests via Google.
+`--invite-email` is **repeatable** and is merged with `~/.config/mention-scout/invite-emails.json`. Guests are Calendar **attendees** (`sendUpdates=all`). Mention-scout does **not** SMTP-mail invitees. Requires `--calendar-add-new`. Ops caution: each matched new market can notify external guests via Google.
 
 Behavior summary:
 
@@ -265,7 +265,7 @@ Behavior summary:
 | Missing schedule | no calendar row; one error email per ticker |
 | Calendar error email | sent even if `--email-new` is off (SMTP still required) |
 | Eligibility gate | phrases file only (no `--calendar-types`) |
-| `--invite-email` | off; when set, attendees on new calendar rows only |
+| `--invite-email` / `invite-emails.json` | unit default `cherylr125@gmail.com`; file + CLI merge |
 
 `--email-new` remains independent of calendar success/failure. Never commit `client_secret.json`, `token.json`, or live owner config files.
 
@@ -340,8 +340,8 @@ For unattended `--watch-new` (optionally with email) under **user** systemd — 
 
 ### Prerequisites
 
-- Python 3 on `PATH` (installer records an absolute interpreter path)
-- A git checkout that contains `./mention_scout.py`
+- A checkout at `~/code/dev/mention-scout` with `venv/bin/python` (systemd `%h` paths)
+- Or pass `--python` / `--repo-root` / `--working-directory` for another layout
 - For email alerts (default in the generated unit): `swaks` on `PATH` plus Google (`~/.config/.google-password`) or SMTP2GO (`email.json` + `smtp`) — same as interactive `--email-new`
 - A working user systemd session (`systemctl --user`)
 
@@ -353,7 +353,13 @@ From the repo root:
 ./scripts/install-user-service.sh --enable-now
 ```
 
-Defaults bake **watch + email** into the unit (`--watch-new --email-new`). Interactive CLI defaults are unchanged: bare `./mention_scout.py --watch-new` stays watch-only unless you pass `--email-new`.
+Default unit ExecStart:
+
+```
+ExecStart=%h/code/dev/mention-scout/venv/bin/python %h/code/dev/mention-scout/mention_scout.py --watch-new --email-new --calendar-add-new --invite-email cherylr125@gmail.com
+```
+
+Calendar invitees also come from `~/.config/mention-scout/invite-emails.json` (installer writes the example if missing). CLI `--invite-email` is merged with that file. Interactive CLI defaults are unchanged: bare `./mention_scout.py --watch-new` stays watch-only.
 
 Safer bring-up while tuning filters (watch only):
 
@@ -368,7 +374,7 @@ Dry-run (no writes, no `systemctl` side effects):
 ./scripts/install-user-service.sh --dry-run --no-email
 ```
 
-Other useful flags: `--disable`, `--uninstall`, `--poll-seconds N`, `--working-directory PATH`, `--python PATH`, `--unit-name NAME`, `--extra-args "..."`, `--strict` (fail email preflight instead of warning).
+Other useful flags: `--disable`, `--uninstall`, `--poll-seconds N`, `--working-directory PATH`, `--python PATH`, `--no-calendar`, `--no-invite`, `--invite-email ADDR`, `--unit-name NAME`, `--extra-args "..."`, `--strict` (fail email preflight instead of warning).
 
 ### Boot without interactive login (linger)
 

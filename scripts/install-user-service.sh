@@ -10,6 +10,8 @@ DEFAULT_REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 UNIT_NAME="mention-scout-watch.service"
 TEMPLATE_REL="deploy/systemd/mention-scout-watch.service"
 EMAIL_MODE="on" # on | off
+CALENDAR_MODE="on" # on | off
+INVITE_MODE="on" # on | off
 DO_ENABLE=0
 DO_START=0
 DO_DISABLE=0
@@ -19,9 +21,15 @@ STRICT=0
 POLL_SECONDS=""
 WORKING_DIRECTORY=""
 PYTHON_BIN=""
+PYTHON_EXPLICIT=0
+REPO_ROOT_EXPLICIT=0
 EXTRA_ARGS=""
 REPO_ROOT="${DEFAULT_REPO_ROOT}"
 ENABLE_LINGER=0
+DEFAULT_SCOUT_DIR='%h/code/dev/mention-scout'
+DEFAULT_INVITE_EMAIL="cherylr125@gmail.com"
+INVITE_EMAILS=()
+INVITE_EMAILS_SET=0
 
 usage() {
   cat <<'EOF'
@@ -31,7 +39,11 @@ Install or manage a systemd --user unit for long-running mention-scout watch.
 
 Options:
   --email              Include --email-new in ExecStart (default)
-  --no-email           Watch only (--watch-new)
+  --no-email           Omit --email-new
+  --calendar           Include --calendar-add-new in ExecStart (default)
+  --no-calendar        Omit --calendar-add-new and --invite-email
+  --invite-email ADDR  Bake --invite-email ADDR (repeatable; default cherylr125@gmail.com)
+  --no-invite          Omit --invite-email from ExecStart (app still reads invite-emails.json)
   --enable             systemctl --user enable <unit>
   --start / --now      systemctl --user start <unit>
   --enable-now         enable + start
@@ -41,8 +53,8 @@ Options:
   --strict             Fail email preflight if swaks/password missing or mode unsafe
   --poll-seconds N     Bake --poll-seconds N into ExecStart (app default 300 if omitted)
   --working-directory PATH
-                       Override WorkingDirectory (default: repo checkout root)
-  --python PATH        Absolute python interpreter (default: command -v python3)
+                       Override WorkingDirectory (default: %h/code/dev/mention-scout)
+  --python PATH        Python interpreter (default: %h/code/dev/mention-scout/venv/bin/python)
   --unit-name NAME     Unit filename (default: mention-scout-watch.service)
   --extra-args "..."   Append extra CLI args to ExecStart (trusted escape hatch)
   --repo-root PATH     Override repo root detection
@@ -74,6 +86,10 @@ is_abs_path() {
   [[ "${1:-}" == /* ]]
 }
 
+is_specifier_path() {
+  [[ "${1:-}" == *%h* || "${1:-}" == *%u* ]]
+}
+
 require_positive_int() {
   local name="$1" value="$2"
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "${name} must be a positive integer (got: ${value})"
@@ -87,6 +103,28 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-email)
       EMAIL_MODE="off"
+      shift
+      ;;
+    --calendar)
+      CALENDAR_MODE="on"
+      shift
+      ;;
+    --no-calendar)
+      CALENDAR_MODE="off"
+      INVITE_MODE="off"
+      shift
+      ;;
+    --invite-email)
+      [[ $# -ge 2 ]] || die "--invite-email requires an address"
+      INVITE_EMAILS+=("$2")
+      INVITE_EMAILS_SET=1
+      INVITE_MODE="on"
+      shift 2
+      ;;
+    --no-invite)
+      INVITE_MODE="off"
+      INVITE_EMAILS=()
+      INVITE_EMAILS_SET=1
       shift
       ;;
     --enable)
@@ -132,6 +170,7 @@ while [[ $# -gt 0 ]]; do
     --python)
       [[ $# -ge 2 ]] || die "--python requires a path"
       PYTHON_BIN="$2"
+      PYTHON_EXPLICIT=1
       shift 2
       ;;
     --unit-name)
@@ -147,6 +186,7 @@ while [[ $# -gt 0 ]]; do
     --repo-root)
       [[ $# -ge 2 ]] || die "--repo-root requires a path"
       REPO_ROOT="$2"
+      REPO_ROOT_EXPLICIT=1
       shift 2
       ;;
     --enable-linger)
@@ -178,45 +218,56 @@ if [[ "$DO_DISABLE" -eq 1 && ( "$DO_ENABLE" -eq 1 || "$DO_START" -eq 1 ) ]]; the
   die "--disable cannot be combined with --enable/--start/--enable-now"
 fi
 
-# Resolve repo root
+# Resolve repo root (checkout that contains the unit template)
 if [[ ! -d "$REPO_ROOT" ]]; then
   die "Repo root is not a directory: $REPO_ROOT"
 fi
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
-
-ENTRY_PATH="${REPO_ROOT}/mention_scout.py"
 TEMPLATE_PATH="${REPO_ROOT}/${TEMPLATE_REL}"
 
-if [[ ! -e "$ENTRY_PATH" && ! -L "$ENTRY_PATH" ]]; then
-  die "Stable entry not found: $ENTRY_PATH"
+if [[ "$CALENDAR_MODE" == "on" && "$INVITE_MODE" == "on" && "$INVITE_EMAILS_SET" -eq 0 ]]; then
+  INVITE_EMAILS=("$DEFAULT_INVITE_EMAIL")
 fi
-# Keep stable entry basename (symlink OK). Do not resolve to kalshi_mention_scout.py.
-ENTRY_PATH="${REPO_ROOT}/mention_scout.py"
 
-if [[ -z "$WORKING_DIRECTORY" ]]; then
-  WORKING_DIRECTORY="$REPO_ROOT"
+# ExecStart defaults to systemd %h paths so the unit is portable across this user's hosts.
+if [[ "$REPO_ROOT_EXPLICIT" -eq 1 ]]; then
+  ENTRY_PATH="${REPO_ROOT}/mention_scout.py"
+  if [[ ! -e "$ENTRY_PATH" && ! -L "$ENTRY_PATH" ]]; then
+    die "Stable entry not found: $ENTRY_PATH"
+  fi
+  if [[ -z "$WORKING_DIRECTORY" ]]; then
+    WORKING_DIRECTORY="$REPO_ROOT"
+  fi
+else
+  ENTRY_PATH="${DEFAULT_SCOUT_DIR}/mention_scout.py"
+  if [[ -z "$WORKING_DIRECTORY" ]]; then
+    WORKING_DIRECTORY="$DEFAULT_SCOUT_DIR"
+  fi
 fi
-if [[ ! -d "$WORKING_DIRECTORY" ]]; then
-  die "WorkingDirectory is not a directory: $WORKING_DIRECTORY"
-fi
-WORKING_DIRECTORY="$(cd "$WORKING_DIRECTORY" && pwd)"
 
 if [[ -z "$PYTHON_BIN" ]]; then
-  if ! PYTHON_BIN="$(command -v python3 2>/dev/null)"; then
-    die "python3 not found on PATH; pass --python /path/to/python"
+  PYTHON_BIN="${DEFAULT_SCOUT_DIR}/venv/bin/python"
+fi
+
+if ! is_specifier_path "$PYTHON_BIN"; then
+  if ! is_abs_path "$PYTHON_BIN"; then
+    if resolved_py="$(command -v "$PYTHON_BIN" 2>/dev/null)"; then
+      PYTHON_BIN="$resolved_py"
+    fi
+  fi
+  if is_abs_path "$PYTHON_BIN"; then
+    PYTHON_BIN="$(readlink -f "$PYTHON_BIN")"
+  fi
+  if [[ ! -x "$PYTHON_BIN" ]]; then
+    die "Python interpreter is not executable: $PYTHON_BIN"
   fi
 fi
-# Prefer absolute path for systemd ExecStart
-if ! is_abs_path "$PYTHON_BIN"; then
-  if resolved_py="$(command -v "$PYTHON_BIN" 2>/dev/null)"; then
-    PYTHON_BIN="$resolved_py"
+
+if ! is_specifier_path "$WORKING_DIRECTORY"; then
+  if [[ ! -d "$WORKING_DIRECTORY" ]]; then
+    die "WorkingDirectory is not a directory: $WORKING_DIRECTORY"
   fi
-fi
-if is_abs_path "$PYTHON_BIN"; then
-  PYTHON_BIN="$(readlink -f "$PYTHON_BIN")"
-fi
-if [[ ! -x "$PYTHON_BIN" ]]; then
-  die "Python interpreter is not executable: $PYTHON_BIN"
+  WORKING_DIRECTORY="$(cd "$WORKING_DIRECTORY" && pwd)"
 fi
 
 case "$UNIT_NAME" in
@@ -257,6 +308,15 @@ build_exec_start() {
   local -a cmd=("$PYTHON_BIN" "$ENTRY_PATH" "--watch-new")
   if [[ "$EMAIL_MODE" == "on" ]]; then
     cmd+=("--email-new")
+  fi
+  if [[ "$CALENDAR_MODE" == "on" ]]; then
+    cmd+=("--calendar-add-new")
+    if [[ "$INVITE_MODE" == "on" ]]; then
+      local addr
+      for addr in "${INVITE_EMAILS[@]}"; do
+        cmd+=("--invite-email" "$addr")
+      done
+    fi
   fi
   if [[ -n "$POLL_SECONDS" ]]; then
     cmd+=("--poll-seconds" "$POLL_SECONDS")
@@ -395,6 +455,8 @@ print_summary() {
   info "Python:             ${PYTHON_BIN}"
   info "Entry:              ${ENTRY_PATH}"
   info "Email in unit:      ${EMAIL_MODE}"
+  info "Calendar in unit:   ${CALENDAR_MODE}"
+  info "Invite in unit:     ${INVITE_MODE}"
   info "Cache/queue note:   relative paths resolve under WorkingDirectory"
 }
 
@@ -447,6 +509,15 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   do_enable_linger
   maybe_hint_linger
   exit 0
+fi
+
+INVITE_CONFIG="${HOME}/.config/mention-scout/invite-emails.json"
+INVITE_EXAMPLE="${REPO_ROOT}/deploy/config/invite-emails.example.json"
+if [[ ! -f "$INVITE_CONFIG" && -f "$INVITE_EXAMPLE" ]]; then
+  mkdir -p "$(dirname "$INVITE_CONFIG")" || die "Cannot create ${INVITE_CONFIG%/*}"
+  cp "$INVITE_EXAMPLE" "$INVITE_CONFIG"
+  chmod 600 "$INVITE_CONFIG"
+  info "Wrote ${INVITE_CONFIG}"
 fi
 
 mkdir -p "$UNIT_DIR" || die "Cannot create unit directory: $UNIT_DIR"
