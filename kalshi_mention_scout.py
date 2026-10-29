@@ -40,8 +40,14 @@ Changes in v10:
   * Bumps the cache format so a v9 compact cache is rebuilt once with the
     corrected query-status marker.
 
-Changes in v16.6 / MS-0022:
+Changes in v16.7 / MS-0022:
   * SMTP2GO default ``--email-from`` is ``vern@ryangrimm.net``.
+
+Changes in v16.6 / MS-0023:
+  * User-unit default ExecStart uses ``%h/code/dev/mention-scout/venv/bin/python``
+    and ``--watch-new --email-new --calendar-add-new --invite-email cherylr125@gmail.com``.
+  * ``~/.config/mention-scout/invite-emails.json`` supplies extra calendar attendees
+    (merged with ``--invite-email``).
 
 Changes in v16.5 / MS-0020:
   * Email provider is selected by ``~/.config/mention-scout/email.json``
@@ -150,7 +156,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-VERSION = "16.6.0"
+VERSION = "16.7.0"
 CACHE_FORMAT_VERSION = 5
 DEFAULT_MENTION_CACHE_FILE = ".kalshi_mention_scout_mentions_cache.json"
 DEFAULT_FULL_CACHE_FILE = ".kalshi_mention_scout_full_cache.json"
@@ -172,6 +178,7 @@ DEFAULT_CALENDAR_MATCHES_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "calendar-mat
 DEFAULT_CALENDAR_CLIENT_SECRET_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "client_secret.json"
 DEFAULT_CALENDAR_TOKEN_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "token.json"
 DEFAULT_CALENDAR_STATE_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "calendar-added.json"
+DEFAULT_INVITE_EMAILS_FILE = DEFAULT_MENTION_SCOUT_CONFIG_DIR / "invite-emails.json"
 DEFAULT_CALENDAR_ID = "primary"
 DEFAULT_CALENDAR_DURATION_MINUTES = 60
 CALENDAR_MATCH_FILE_VERSION = 1
@@ -1622,6 +1629,7 @@ def _watch_child_arguments(original_argv: list[str]) -> list[str]:
         "--calendar-state",
         "--calendar-duration-minutes",
         "--invite-email",
+        "--invite-emails-file",
         "--match",
         "--time",
         "--duration-minutes",
@@ -2990,6 +2998,46 @@ def normalize_invite_emails(raw: list[str] | None, *, flag: str = "--invite-emai
             f"(got {len(out)} after dedupe)"
         )
     return out
+
+
+def load_invite_emails_config(path: Path) -> list[str]:
+    """Read ~/.config/mention-scout/invite-emails.json. Missing file is empty."""
+    config_path = path.expanduser()
+    if not config_path.exists():
+        return []
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"invite-emails config is not valid JSON ({config_path}): {exc.msg}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"cannot read invite-emails config {config_path}: {exc}") from exc
+    if isinstance(payload, list):
+        raw = payload
+    elif isinstance(payload, dict):
+        raw = payload.get("invite_emails", payload.get("emails"))
+        if raw is None:
+            return []
+    else:
+        raise RuntimeError(f"invite-emails config must be a JSON object or array: {config_path}")
+    if not isinstance(raw, list):
+        raise RuntimeError(
+            f"invite-emails config invite_emails must be a JSON array: {config_path}"
+        )
+    return normalize_invite_emails(
+        [str(item) for item in raw],
+        flag=str(config_path),
+    )
+
+
+def merge_invite_emails(*groups: list[str] | None) -> list[str]:
+    """Concatenate invite groups, then validate/dedupe in first-seen order."""
+    combined: list[str] = []
+    for group in groups:
+        if group:
+            combined.extend(group)
+    return normalize_invite_emails(combined)
 
 
 def build_calendar_event_body(
@@ -4404,9 +4452,16 @@ def build_parser() -> argparse.ArgumentParser:
         dest="invite_email",
         help=(
             "With --calendar-add-new, add ADDRESS as a Google Calendar attendee on each "
-            "newly created event (repeatable). Google is asked to notify guests "
-            "(sendUpdates=all). Does not send scout SMTP mail to invitees."
+            "newly created event (repeatable). Merged with --invite-emails-file. "
+            "Google is asked to notify guests (sendUpdates=all). Does not send scout "
+            "SMTP mail to invitees."
         ),
+    )
+    parser.add_argument(
+        "--invite-emails-file",
+        type=Path,
+        default=DEFAULT_INVITE_EMAILS_FILE,
+        help="JSON list of calendar invitees (~/.config/mention-scout/invite-emails.json)",
     )
     parser.add_argument(
         "--audit-calendar-matches",
@@ -4498,10 +4553,16 @@ def main() -> int:
     selected_types = parse_type_filter(getattr(args, "mention_types", None))
     args.selected_mention_types = selected_types
     try:
-        args.invite_emails = normalize_invite_emails(getattr(args, "invite_email", None))
+        cli_invites = normalize_invite_emails(getattr(args, "invite_email", None))
+        file_invites: list[str] = []
+        if args.calendar_add_new:
+            file_invites = load_invite_emails_config(
+                Path(getattr(args, "invite_emails_file", DEFAULT_INVITE_EMAILS_FILE))
+            )
+        args.invite_emails = merge_invite_emails(file_invites, cli_invites)
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from exc
-    if args.invite_emails and not args.calendar_add_new:
+    if cli_invites and not args.calendar_add_new:
         raise SystemExit(
             "--invite-email requires --calendar-add-new "
             "(calendar attendees only; scout does not SMTP-mail invitees)"
