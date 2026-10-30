@@ -133,21 +133,64 @@ def test_list_invalid_json_exits_nonzero(tmp_path: Path, capsys: pytest.CaptureF
     assert "not valid JSON" in capsys.readouterr().err
 
 
-def test_target_unknown_ticker_exits_1(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_target_unknown_ticker_empty_kalshi_exits_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     path = _write_calendar(tmp_path / "calendar-added.json", SAMPLE_ENTRIES)
     opener = RecordingOpener()
     code = mm.main(
-        ["target", "KXDOESNOTEXIST-26SEP25", "--json", str(path)],
+        ["target", "KXDOESNOTEXIST-26SEP25", "--json", str(path), "--dry-run"],
         opener=opener,
-        urlopen_fn=FakeUrlOpen({}),
+        urlopen_fn=FakeUrlOpen({"": {"markets": [], "cursor": ""}}),
         sleep_fn=lambda _s: None,
         environ={"DISPLAY": ":0"},
     )
     assert code == 1
     err = capsys.readouterr().err
-    assert "not found" in err
-    assert "mention_markets.py list" in err
+    assert "fetching from Kalshi" in err
+    assert "Kalshi returned no markets" in err
     assert opener.urls == []
+
+
+def test_target_unknown_ticker_fetches_kalshi(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _write_calendar(tmp_path / "calendar-added.json", SAMPLE_ENTRIES)
+    opener = RecordingOpener()
+    code = mm.main(
+        ["target", "KXWORLDNEWSMENTION-26OCT30", "--json", str(path), "--dry-run"],
+        opener=opener,
+        urlopen_fn=FakeUrlOpen(_openai_pages()),
+        sleep_fn=lambda _s: None,
+        environ={"DISPLAY": ":0"},
+    )
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "fetching from Kalshi" in captured.err
+    assert "kalshi.com/markets/" in captured.out
+    assert opener.urls == []
+
+
+def test_target_missing_catalog_fetches_kalshi(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / "nope.json"
+    opener = RecordingOpener()
+    code = mm.main(
+        ["target", "KXWORLDNEWSMENTION-26OCT30", "--json", str(missing), "--dry-run"],
+        opener=opener,
+        urlopen_fn=FakeUrlOpen(_openai_pages()),
+        sleep_fn=lambda _s: None,
+        environ={"DISPLAY": ":0"},
+    )
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "fetching from Kalshi" in err
+    assert opener.urls == []
+
+
+def test_load_listed_events_if_present_missing_is_empty(tmp_path: Path) -> None:
+    assert mm.load_listed_events_if_present(tmp_path / "nope.json") == []
 
 
 @pytest.mark.parametrize(
