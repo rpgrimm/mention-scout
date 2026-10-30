@@ -2,7 +2,8 @@
 """List calendar-added mention events and open Google News tabs per market word.
 
 Discovery only. Never places or cancels orders. Public unauthenticated Kalshi
-GET plus local calendar-added JSON; no API keys.
+GET; local calendar-added JSON is a catalog for ``list`` and an optional cache
+for ``target``. If the ticker is missing locally, ``target`` fetches Kalshi.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen as stdlib_urlopen
 
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DEFAULT_JSON_PATH = Path.home() / ".config" / "mention-scout" / "calendar-added.json"
 KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 KNOWN_ACTIONS = ("google-news",)
@@ -166,6 +167,14 @@ def load_listed_events(path: Path) -> list[ListedEvent]:
             winners[lookup] = event
 
     return sorted(winners.values(), key=lambda item: _parse_added_at(item.added_at_utc), reverse=True)
+
+
+def load_listed_events_if_present(path: Path) -> list[ListedEvent]:
+    """Like load_listed_events, but a missing file is an empty catalog."""
+    json_path = path.expanduser()
+    if not json_path.exists():
+        return []
+    return load_listed_events(json_path)
 
 
 def find_event(events: list[ListedEvent], requested: str) -> ListedEvent | None:
@@ -601,21 +610,29 @@ def cmd_target(
         print(f"Unknown action {action!r}. Known actions: {known}", file=sys.stderr)
         return 1
 
-    events = load_listed_events(json_path)
-    event = find_event(events, requested_ticker)
+    ticker = ticker_from_key(requested_ticker)
+    if not ticker:
+        raise MentionMarketsError("event ticker is empty")
+    events = load_listed_events_if_present(json_path)
+    event = find_event(events, ticker)
+    from_catalog = event is not None
     if event is None:
+        event = ListedEvent(ticker=ticker, added_at_utc="", matched_phrase="")
         print(
-            f"Event ticker {requested_ticker!r} not found in {json_path.expanduser()}. "
-            "Run: ./mention_markets.py list",
+            f"{event.ticker} not in {json_path.expanduser()}; fetching from Kalshi",
             file=sys.stderr,
         )
-        return 1
 
     markets = fetch_markets_rest_paginated(
         event.ticker,
         urlopen_fn=urlopen_fn,
         sleep_fn=sleep_fn,
     )
+    if not from_catalog and not markets:
+        raise MentionMarketsError(
+            f"Event ticker {event.ticker!r} is not in {json_path.expanduser()} "
+            "and Kalshi returned no markets. Check the ticker."
+        )
     open_markets = usable_markets(markets)
     resolved_mode = resolve_mode(mode, event.ticker, guest=guest)
     resolved_guest = re.sub(r"\s+", " ", str(guest or "")).strip() or None
@@ -674,7 +691,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="mention_markets.py",
         description=(
             "List calendar-added mention events and open Google News search tabs "
-            "for an event's market words. Discovery only — no trading."
+            "for an event's market words. target fetches Kalshi if the ticker is "
+            "not in calendar-added.json. Discovery only — no trading."
         ),
     )
     parser.add_argument(

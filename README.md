@@ -289,7 +289,7 @@ Behavior summary:
 
 ## Mention markets util
 
-`./mention_markets.py` is a separate desktop helper for events already recorded in `~/.config/mention-scout/calendar-added.json`. It lists those event tickers, fetches that event's mention markets from **Kalshi public REST** (unauthenticated GET only), opens the parent event on **kalshi.com in Google Chrome**, then opens a Google search tab per market word. Discovery only — **no trading**.
+`./mention_markets.py` lists event tickers from `~/.config/mention-scout/calendar-added.json`. `target EVENT_TICKER` fetches that event's mention markets from **Kalshi public REST** (unauthenticated GET only) even if the ticker is not in the local JSON (for example when local watch is not running). It opens the parent event on **kalshi.com in Google Chrome**, then a Google search tab per market word. Discovery only — **no trading**.
 
 ```bash
 # Events already added to calendar (newest first)
