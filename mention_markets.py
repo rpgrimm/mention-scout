@@ -4,6 +4,7 @@
 Discovery only. Never places or cancels orders. Public unauthenticated Kalshi
 GET; local calendar-added JSON is a catalog for ``list`` and an optional cache
 for ``target``. If the ticker is missing locally, ``target`` fetches Kalshi.
+Kalshi ``event_ticker`` queries use uppercase.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen as stdlib_urlopen
 
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 DEFAULT_JSON_PATH = Path.home() / ".config" / "mention-scout" / "calendar-added.json"
 KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 KNOWN_ACTIONS = ("google-news",)
@@ -104,6 +105,11 @@ def ticker_from_key(key: str) -> str:
     if "::" in raw:
         raw = raw.split("::", 1)[0].strip()
     return raw
+
+
+def kalshi_event_ticker(key: str) -> str:
+    """Kalshi event tickers are uppercase; lowercase CLI input must be folded."""
+    return ticker_from_key(key).upper()
 
 
 def _parse_added_at(value: str) -> tuple[int, datetime | str]:
@@ -452,7 +458,7 @@ def fetch_markets_rest_paginated(
     while True:
         pages += 1
         params: dict[str, Any] = {
-            "event_ticker": event_ticker,
+            "event_ticker": kalshi_event_ticker(event_ticker),
             "limit": PAGE_LIMIT,
         }
         if cursor:
@@ -610,7 +616,7 @@ def cmd_target(
         print(f"Unknown action {action!r}. Known actions: {known}", file=sys.stderr)
         return 1
 
-    ticker = ticker_from_key(requested_ticker)
+    ticker = kalshi_event_ticker(requested_ticker)
     if not ticker:
         raise MentionMarketsError("event ticker is empty")
     events = load_listed_events_if_present(json_path)

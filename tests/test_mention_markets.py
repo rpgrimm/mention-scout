@@ -107,6 +107,12 @@ def test_ticker_from_key_strips_suffix() -> None:
     assert mm.ticker_from_key("  KXWORLDNEWSMENTION-26SEP25  ") == "KXWORLDNEWSMENTION-26SEP25"
 
 
+def test_kalshi_event_ticker_uppercases() -> None:
+    assert mm.kalshi_event_ticker("kxmamdanimention-26nov08") == "KXMAMDANIMENTION-26NOV08"
+    assert mm.kalshi_event_ticker("kxmamdanimention-26nov08::primary") == "KXMAMDANIMENTION-26NOV08"
+    assert mm.kalshi_event_ticker("KXMAMDANIMENTION-26NOV08") == "KXMAMDANIMENTION-26NOV08"
+
+
 def test_list_formatting_newest_first(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     path = _write_calendar(tmp_path / "calendar-added.json", SAMPLE_ENTRIES)
     assert mm.main(["list", "--json", str(path)]) == 0
@@ -191,6 +197,25 @@ def test_target_missing_catalog_fetches_kalshi(
 
 def test_load_listed_events_if_present_missing_is_empty(tmp_path: Path) -> None:
     assert mm.load_listed_events_if_present(tmp_path / "nope.json") == []
+
+
+def test_target_lowercase_ticker_uppercases_kalshi_query(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / "nope.json"
+    fake_http = FakeUrlOpen(_openai_pages())
+    code = mm.main(
+        ["target", "kxworldnewsmention-26oct30", "--json", str(missing), "--dry-run"],
+        opener=RecordingOpener(),
+        urlopen_fn=fake_http,
+        sleep_fn=lambda _s: None,
+        environ={"DISPLAY": ":0"},
+    )
+    assert code == 0
+    qs = parse_qs(urlparse(fake_http.calls[0]).query)
+    assert qs["event_ticker"] == ["KXWORLDNEWSMENTION-26OCT30"]
+    err = capsys.readouterr().err
+    assert "KXWORLDNEWSMENTION-26OCT30 not in" in err
 
 
 @pytest.mark.parametrize(
