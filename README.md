@@ -298,6 +298,11 @@ Behavior summary:
 # Preview Google News URLs without opening a browser
 ./mention_markets.py target KXWORLDNEWSMENTION-26SEP25 --dry-run
 
+# Today's World News Tonight ticker (KXWORLDNEWSMENTION-YYMONDD, local date)
+./mm-world-news
+./mm-world-news --dry-run
+./mm-world-news --date 2026-11-12
+
 # Open kalshi.com in Chrome, then one Google "{word} news" tab per market
 ./mention_markets.py target KXWORLDNEWSMENTION-26OCT15
 ./mention_markets.py target KXWORLDNEWSMENTION-26SEP25 --action google-news
@@ -323,6 +328,7 @@ Slash phrases become a single query (`OpenAI / Anthropic` → spaces). Tabs open
 | `./mention_scout.py` | Stable entry (symlink) |
 | `kalshi_mention_scout.py` | Implementation (v16) |
 | `./mention_markets.py` | Calendar-added events → Google News tabs (MS-0016) |
+| `./mm-world-news` | Today's `KXWORLDNEWSMENTION-YYMONDD` target (MS-0026) |
 | `deploy/systemd/` | User unit template (placeholders) |
 | `deploy/config/calendar-matches.example.json` | Example calendar phrase list (copy to `~/.config/mention-scout/`) |
 | `scripts/install-user-service.sh` | Install/update/disable user watch unit |

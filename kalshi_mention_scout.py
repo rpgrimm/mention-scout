@@ -40,6 +40,10 @@ Changes in v10:
   * Bumps the cache format so a v9 compact cache is rebuilt once with the
     corrected query-status marker.
 
+Changes in v16.10 / MS-0026:
+  * ``mm-world-news`` runs today's ``mention_markets.py target
+    KXWORLDNEWSMENTION-YYMONDD`` (local date; ``--date YYYY-MM-DD`` override).
+
 Changes in v16.9 / MS-0025:
   * ``mention_markets.py target`` uppercases the event ticker before the Kalshi GET
     (``kxmamdanimention-26nov08`` → ``KXMAMDANIMENTION-26NOV08``).
@@ -164,7 +168,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-VERSION = "16.9.0"
+VERSION = "16.10.0"
 CACHE_FORMAT_VERSION = 5
 DEFAULT_MENTION_CACHE_FILE = ".kalshi_mention_scout_mentions_cache.json"
 DEFAULT_FULL_CACHE_FILE = ".kalshi_mention_scout_full_cache.json"

@@ -19,7 +19,7 @@ import sys
 import time
 import webbrowser
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
@@ -27,7 +27,22 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen as stdlib_urlopen
 
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
+WORLD_NEWS_EVENT_PREFIX = "KXWORLDNEWSMENTION"
+ENGLISH_MONTH_ABBREV = (
+    "JAN",
+    "FEB",
+    "MAR",
+    "APR",
+    "MAY",
+    "JUN",
+    "JUL",
+    "AUG",
+    "SEP",
+    "OCT",
+    "NOV",
+    "DEC",
+)
 DEFAULT_JSON_PATH = Path.home() / ".config" / "mention-scout" / "calendar-added.json"
 KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 KNOWN_ACTIONS = ("google-news",)
@@ -110,6 +125,15 @@ def ticker_from_key(key: str) -> str:
 def kalshi_event_ticker(key: str) -> str:
     """Kalshi event tickers are uppercase; lowercase CLI input must be folded."""
     return ticker_from_key(key).upper()
+
+
+def world_news_event_ticker(when: date | None = None) -> str:
+    """Today's World News Tonight event ticker: ``KXWORLDNEWSMENTION-YYMONDD``."""
+    day = when or date.today()
+    return (
+        f"{WORLD_NEWS_EVENT_PREFIX}-"
+        f"{day.strftime('%y')}{ENGLISH_MONTH_ABBREV[day.month - 1]}{day.strftime('%d')}"
+    )
 
 
 def _parse_added_at(value: str) -> tuple[int, datetime | str]:
@@ -761,6 +785,76 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Delay in seconds between browser tabs (default: {DEFAULT_SLEEP})",
     )
     return parser
+
+
+WORLD_NEWS_HELPER_USAGE = """usage: mm-world-news [--date YYYY-MM-DD] [target options]
+
+Run mention_markets.py target KXWORLDNEWSMENTION-YYMONDD for today
+(local date; English month abbrev, e.g. 2026-11-12 → KXWORLDNEWSMENTION-26NOV12).
+Remaining args are passed to target (--dry-run, --sleep, --json, ...).
+"""
+
+
+def parse_world_news_helper_argv(argv: list[str]) -> tuple[date, list[str]]:
+    """Pull --date from helper argv; leftover tokens go to target."""
+    when = date.today()
+    forwarded: list[str] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "--date":
+            if i + 1 >= len(argv):
+                raise MentionMarketsError("--date requires YYYY-MM-DD")
+            try:
+                when = date.fromisoformat(argv[i + 1])
+            except ValueError as exc:
+                raise MentionMarketsError(
+                    f"--date must be YYYY-MM-DD (got {argv[i + 1]!r})"
+                ) from exc
+            i += 2
+            continue
+        if token.startswith("--date="):
+            raw = token.split("=", 1)[1]
+            try:
+                when = date.fromisoformat(raw)
+            except ValueError as exc:
+                raise MentionMarketsError(f"--date must be YYYY-MM-DD (got {raw!r})") from exc
+            i += 1
+            continue
+        forwarded.append(token)
+        i += 1
+    return when, forwarded
+
+
+def main_world_news(
+    argv: list[str] | None = None,
+    *,
+    opener: Opener | None = None,
+    urlopen_fn: UrlOpenFn | None = None,
+    sleep_fn: SleepFn | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] in ("-h", "--help"):
+        print(WORLD_NEWS_HELPER_USAGE.strip())
+        return 0
+    if args and args[0] in ("-V", "--version"):
+        print(f"mm-world-news {VERSION}")
+        return 0
+    try:
+        when, forwarded = parse_world_news_helper_argv(args)
+    except MentionMarketsError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    ticker = world_news_event_ticker(when)
+    print(f"mm-world-news: ./mention_markets.py target {ticker}", file=sys.stderr)
+    return main(
+        ["target", ticker, *forwarded],
+        opener=opener,
+        urlopen_fn=urlopen_fn,
+        sleep_fn=sleep_fn,
+        environ=environ,
+    )
 
 
 def main(
