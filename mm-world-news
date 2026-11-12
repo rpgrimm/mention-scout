@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Today's World News Tonight mention-markets helper. Discovery only."""
+
+from __future__ import annotations
+
+import sys
+
+from mention_markets import main_world_news
+
+if __name__ == "__main__":
+    raise SystemExit(main_world_news())

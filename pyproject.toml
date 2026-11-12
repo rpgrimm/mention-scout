@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mention-scout"
-version = "16.9.0"
+version = "16.10.0"
 description = "Find Kalshi mention markets and optionally watch, email, and add matches to Google Calendar."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,6 +24,7 @@ dev = [
 [project.scripts]
 mention-scout = "kalshi_mention_scout:main"
 mention-markets = "mention_markets:main"
+mm-world-news = "mention_markets:main_world_news"
 
 [tool.setuptools]
 py-modules = ["kalshi_mention_scout", "mention_markets"]

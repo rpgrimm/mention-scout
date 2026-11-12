@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -687,3 +688,46 @@ def test_help_and_version() -> None:
     with pytest.raises(SystemExit) as version_exc:
         mm.main(["--version"])
     assert version_exc.value.code == 0
+
+
+def test_world_news_event_ticker_yy_mon_dd() -> None:
+    assert mm.world_news_event_ticker(date(2026, 11, 12)) == "KXWORLDNEWSMENTION-26NOV12"
+    assert mm.world_news_event_ticker(date(2026, 9, 25)) == "KXWORLDNEWSMENTION-26SEP25"
+    assert mm.world_news_event_ticker(date(2026, 10, 5)) == "KXWORLDNEWSMENTION-26OCT05"
+
+
+def test_parse_world_news_helper_argv_date_and_forward() -> None:
+    when, rest = mm.parse_world_news_helper_argv(
+        ["--date", "2026-11-12", "--dry-run", "--sleep", "2"]
+    )
+    assert when == date(2026, 11, 12)
+    assert rest == ["--dry-run", "--sleep", "2"]
+    when2, rest2 = mm.parse_world_news_helper_argv(["--date=2026-09-25"])
+    assert when2 == date(2026, 9, 25)
+    assert rest2 == []
+
+
+def test_mm_world_news_targets_dated_ticker(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / "nope.json"
+    fake_http = FakeUrlOpen(_openai_pages())
+    code = mm.main_world_news(
+        ["--date", "2026-11-12", "--json", str(missing), "--dry-run"],
+        opener=RecordingOpener(),
+        urlopen_fn=fake_http,
+        sleep_fn=lambda _s: None,
+        environ={"DISPLAY": ":0"},
+    )
+    assert code == 0
+    qs = parse_qs(urlparse(fake_http.calls[0]).query)
+    assert qs["event_ticker"] == ["KXWORLDNEWSMENTION-26NOV12"]
+    err = capsys.readouterr().err
+    assert "mention_markets.py target KXWORLDNEWSMENTION-26NOV12" in err
+
+
+def test_mm_world_news_help_and_version(capsys: pytest.CaptureFixture[str]) -> None:
+    assert mm.main_world_news(["--help"]) == 0
+    assert "KXWORLDNEWSMENTION-YYMONDD" in capsys.readouterr().out
+    assert mm.main_world_news(["--version"]) == 0
+    assert "mm-world-news" in capsys.readouterr().out
