@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import date, datetime, timezone
@@ -18,10 +19,20 @@ from urllib.parse import urlencode
 
 import mention_markets as mm
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 ONE = Decimal("1")
 PRICE_QUANT = Decimal("0.0001")
+SIZE_QUANT = Decimal("0.01")
 DEFAULT_INTERVAL = 1.0
+TOP_HIGHLIGHT = 50
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+REVERSE = "\033[7m"
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+CYAN = "\033[96m"
 OPEN_STATUSES = frozenset({"active", "open"})
 ENGLISH_MONTH_ABBREV = (
     "JAN",
@@ -137,6 +148,24 @@ def fetch_orderbook(
     )
 
 
+def size_total(pairs: Any) -> Decimal:
+    total = Decimal("0")
+    if not isinstance(pairs, list):
+        return total
+    for item in pairs:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            total += Decimal(str(item[1]))
+        except (InvalidOperation, ValueError):
+            continue
+    return total
+
+
+def format_size(value: Decimal) -> str:
+    return f"{value.quantize(SIZE_QUANT)}"
+
+
 def summarize_market(market: Mapping[str, Any], book: Mapping[str, Any]) -> dict[str, Any]:
     yes_bids, no_bids = extract_bid_levels(book)
     yes_asks = complement_asks(no_bids)
@@ -146,6 +175,10 @@ def summarize_market(market: Mapping[str, Any], book: Mapping[str, Any]) -> dict
     yes_ask_pairs = as_pairs(yes_asks)
     no_bid_pairs = as_pairs(no_bids, best_first=True)
     no_ask_pairs = as_pairs(no_asks)
+    yes_bid_total = size_total(yes_bid_pairs)
+    yes_ask_total = size_total(yes_ask_pairs)
+    no_bid_total = size_total(no_bid_pairs)
+    no_ask_total = size_total(no_ask_pairs)
     return {
         "ticker": ticker,
         "status": str(market.get("status") or ""),
@@ -158,11 +191,58 @@ def summarize_market(market: Mapping[str, Any], book: Mapping[str, Any]) -> dict
         "yes_ask": yes_ask_pairs[0] if yes_ask_pairs else None,
         "no_bid": no_bid_pairs[0] if no_bid_pairs else None,
         "no_ask": no_ask_pairs[0] if no_ask_pairs else None,
+        "yes_bid_total": format_size(yes_bid_total),
+        "yes_ask_total": format_size(yes_ask_total),
+        "no_bid_total": format_size(no_bid_total),
+        "no_ask_total": format_size(no_ask_total),
         "orderbook": book,
     }
 
 
-def print_snapshot(snapshot: Mapping[str, Any], *, file: TextIO | None = None) -> None:
+def paint(text: str, *codes: str, enabled: bool = True) -> str:
+    if not enabled or not codes:
+        return text
+    return f"{''.join(codes)}{text}{RESET}"
+
+
+def want_color(stream: TextIO, mode: str) -> bool:
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return bool(getattr(stream, "isatty", lambda: False)())
+
+
+def render_levels(pairs: Any, *, kind: str, enabled: bool) -> str:
+    if not isinstance(pairs, list) or not pairs:
+        return "-"
+    rendered: list[str] = []
+    for index, item in enumerate(pairs):
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        text = f"{item[0]} x {item[1]}"
+        if index == 0:
+            accent = YELLOW if kind == "ask" else CYAN
+            text = paint(text, BOLD, REVERSE, accent, enabled=enabled)
+        elif index < TOP_HIGHLIGHT:
+            accent = YELLOW if kind == "ask" else CYAN
+            text = paint(text, accent, enabled=enabled)
+        else:
+            text = paint(text, DIM, enabled=enabled)
+        rendered.append(text)
+    return "  ".join(rendered) if rendered else "-"
+
+
+def print_snapshot(
+    snapshot: Mapping[str, Any],
+    *,
+    file: TextIO | None = None,
+    color: bool = False,
+) -> None:
     out = file if file is not None else sys.stdout
     print(
         f"{snapshot['ts']}  {snapshot['event_ticker']}  "
@@ -177,23 +257,34 @@ def print_snapshot(snapshot: Mapping[str, Any], *, file: TextIO | None = None) -
             print(f"  {item.get('word') or '?'}  {item.get('ticker')}  ERROR {err}", file=out)
             continue
         print(
-            f"  {item.get('word') or '?'}  {item.get('ticker')}  status={item.get('status')}",
+            f"  {item.get('word') or '?'}  {paint(str(item.get('ticker') or ''), DIM, enabled=color)}  "
+            f"status={item.get('status')}",
             file=out,
         )
-        print(f"    YES ask  {_join_pairs(item.get('yes_asks'))}", file=out)
-        print(f"    YES bid  {_join_pairs(item.get('yes_bids'))}", file=out)
-        print(f"    NO  ask  {_join_pairs(item.get('no_asks'))}", file=out)
-        print(f"    NO  bid  {_join_pairs(item.get('no_bids'))}", file=out)
-
-
-def _join_pairs(pairs: Any) -> str:
-    if not isinstance(pairs, list) or not pairs:
-        return "-"
-    rendered: list[str] = []
-    for item in pairs:
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
-            rendered.append(f"{item[0]} x {item[1]}")
-    return "  ".join(rendered) if rendered else "-"
+        yes = paint("YES", GREEN, BOLD, enabled=color)
+        no = paint("NO ", RED, BOLD, enabled=color)
+        ask = paint("ask", YELLOW, BOLD, enabled=color)
+        bid = paint("bid", CYAN, BOLD, enabled=color)
+        print(
+            f"    {yes} {ask}  tot {item.get('yes_ask_total') or '0.00'}  "
+            f"{render_levels(item.get('yes_asks'), kind='ask', enabled=color)}",
+            file=out,
+        )
+        print(
+            f"    {yes} {bid}  tot {item.get('yes_bid_total') or '0.00'}  "
+            f"{render_levels(item.get('yes_bids'), kind='bid', enabled=color)}",
+            file=out,
+        )
+        print(
+            f"    {no} {ask}  tot {item.get('no_ask_total') or '0.00'}  "
+            f"{render_levels(item.get('no_asks'), kind='ask', enabled=color)}",
+            file=out,
+        )
+        print(
+            f"    {no} {bid}  tot {item.get('no_bid_total') or '0.00'}  "
+            f"{render_levels(item.get('no_bids'), kind='bid', enabled=color)}",
+            file=out,
+        )
 
 
 def append_jsonl(path: Path, snapshot: Mapping[str, Any]) -> None:
@@ -254,6 +345,7 @@ def run_watch(
     depth: int,
     max_wait: int,
     max_dumps: int,
+    color_mode: str = "auto",
     urlopen_fn: UrlOpenFn | None = None,
     sleep_fn: SleepFn | None = None,
     clock_fn: ClockFn | None = None,
@@ -319,7 +411,7 @@ def run_watch(
             urlopen_fn=urlopen_fn,
             sleep_fn=sleeper,
         )
-        print_snapshot(snapshot, file=out)
+        print_snapshot(snapshot, file=out, color=want_color(out, color_mode))
         out.flush()
         append_jsonl(log_path, snapshot)
         dump_polls += 1
@@ -379,6 +471,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Stop after N order-book dumps (0 = dump forever)",
     )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Colorize stdout (default: auto; TTY only). JSONL stays plain.",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
 
@@ -414,6 +512,7 @@ def main(
             depth=int(args.depth),
             max_wait=int(args.max_wait),
             max_dumps=int(args.max_dumps),
+            color_mode=str(args.color),
             urlopen_fn=urlopen_fn,
             sleep_fn=sleep_fn,
             clock_fn=clock_fn,

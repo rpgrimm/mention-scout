@@ -117,10 +117,14 @@ def test_wait_then_dump_orderbook_once(tmp_path: Path, capsys: pytest.CaptureFix
     captured = capsys.readouterr()
     assert "waiting for open" in captured.err
     assert "dumping order books" in captured.err
-    assert "YES ask  0.4500 x 40.00" in captured.out
-    assert "YES bid  0.4200 x 100.00  0.4000 x 10.00" in captured.out
-    assert "NO  ask  0.5800 x 100.00  0.6000 x 10.00" in captured.out
-    assert "NO  bid  0.5500 x 40.00" in captured.out
+    assert "YES ask  tot 40.00" in captured.out
+    assert "YES bid  tot 110.00" in captured.out
+    assert "NO  ask  tot 110.00" in captured.out
+    assert "NO  bid  tot 40.00" in captured.out
+    assert "0.4500 x 40.00" in captured.out
+    assert "0.4200 x 100.00  0.4000 x 10.00" in captured.out
+    assert "0.5800 x 100.00  0.6000 x 10.00" in captured.out
+    assert "\033[" not in captured.out
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     payload = json.loads(lines[0])
@@ -131,6 +135,11 @@ def test_wait_then_dump_orderbook_once(tmp_path: Path, capsys: pytest.CaptureFix
     assert market["yes_ask"] == ["0.4500", "40.00"]
     assert market["no_bid"] == ["0.5500", "40.00"]
     assert market["no_ask"] == ["0.5800", "100.00"]
+    assert market["yes_bid_total"] == "110.00"
+    assert market["yes_ask_total"] == "40.00"
+    assert market["no_bid_total"] == "40.00"
+    assert market["no_ask_total"] == "110.00"
+    assert "\033" not in lines[0]
 
 
 def test_complement_asks_are_one_minus_bid() -> None:
@@ -195,3 +204,36 @@ def test_help_and_version() -> None:
     with pytest.raises(SystemExit) as version_exc:
         watch.main(["--version"])
     assert version_exc.value.code == 0
+
+
+def test_color_always_paints_yes_no_bid_ask(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = SequenceUrlOpen(
+        [{"markets": [_market("open")], "cursor": ""}],
+        {"KXWORLDNEWSMENTION-26NOV13-AI": _book()},
+    )
+    code = watch.main(
+        [
+            "KXWORLDNEWSMENTION-26NOV13",
+            "--color",
+            "always",
+            "--interval",
+            "0",
+            "--log",
+            str(tmp_path / "c.jsonl"),
+            "--max-dumps",
+            "1",
+        ],
+        urlopen_fn=fake,
+        sleep_fn=lambda _s: None,
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert watch.GREEN in out
+    assert watch.RED in out
+    assert watch.YELLOW in out
+    assert watch.CYAN in out
+    assert watch.REVERSE in out
+    assert "YES" in out
+    assert "tot 110.00" in out
