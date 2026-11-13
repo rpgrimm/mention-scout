@@ -318,7 +318,7 @@ Slash phrases become a single query (`OpenAI / Anthropic` → spaces). Tabs open
 
 ### Order-book watch
 
-`./mm-orderbook-watch` polls public Kalshi REST every second until the event's markets are `active`/`open`, then prints the book, appends JSONL, and rewrites **one SVG per market** (YES bid/ask vs time, labeled axes). **GET only — no orders.**
+`./mm-orderbook-watch` polls public Kalshi REST every second until the event's markets are `active`/`open`, then prints the book, appends JSONL, and rewrites **one SVG per market** (YES bid/ask plus spread vs time, labeled axes). **GET only — no orders.**
 
 ```bash
 ./mm-orderbook-watch                         # today's KXWORLDNEWSMENTION-YYMONDD

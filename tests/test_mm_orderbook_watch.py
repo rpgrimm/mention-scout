@@ -140,6 +140,8 @@ def test_wait_then_dump_orderbook_once(tmp_path: Path, capsys: pytest.CaptureFix
     assert market["yes_ask_total"] == "40.00"
     assert market["no_bid_total"] == "40.00"
     assert market["no_ask_total"] == "110.00"
+    assert market["yes_spread"] == "0.0300"
+    assert "spread  0.0300" in captured.out
     assert "\033" not in lines[0]
     charts = log_path.parent / f"{log_path.stem}-charts"
     svg_path = charts / "KXWORLDNEWSMENTION-26NOV13-AI.svg"
@@ -147,6 +149,7 @@ def test_wait_then_dump_orderbook_once(tmp_path: Path, capsys: pytest.CaptureFix
     assert svg.startswith("<svg")
     assert "YES bid" in svg
     assert "YES price ($)" in svg
+    assert "Spread ($)" in svg
     assert "Time (UTC)" not in svg
     assert f"Time ({watch.tz_abbrev()})" in svg
     assert "AI / Artificial Intelligence" in svg
@@ -235,7 +238,7 @@ def test_history_chart_polyline_over_time(tmp_path: Path) -> None:
                 "ticker": "KXWORLDNEWSMENTION-26NOV13-AI",
                 "word": "AI / Artificial Intelligence",
                 "yes_bid": ["0.4300", "80.00"],
-                "yes_ask": ["0.4600", "50.00"],
+                "yes_ask": ["0.5000", "50.00"],
                 "yes_bid_total": "90.00",
                 "yes_ask_total": "50.00",
             }
@@ -248,7 +251,12 @@ def test_history_chart_polyline_over_time(tmp_path: Path) -> None:
     assert "polyline" in svg
     assert "#5ce1ff" in svg
     assert "#ffd15c" in svg
+    assert "#ff79c6" in svg
+    assert "polygon" in svg
     assert "YES price ($)" in svg
+    assert "Spread ($)" in svg
+    assert history[ticker]["samples"][0]["spread"] == Decimal("0.0300")
+    assert history[ticker]["samples"][1]["spread"] == Decimal("0.0700")
     assert "Time (UTC)" not in svg
     ny = ZoneInfo("America/New_York")
     svg_ny = watch.render_market_svg(ticker, history[ticker], "KXWORLDNEWSMENTION-26NOV13", tz=ny)

@@ -21,13 +21,19 @@ from urllib.parse import urlencode
 
 import mention_markets as mm
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 CHART_WIDTH = 1100
-CHART_HEIGHT = 620
 CHART_PAD_LEFT = 72
 CHART_PAD_RIGHT = 28
 CHART_PAD_TOP = 88
 CHART_PAD_BOTTOM = 64
+CHART_PRICE_H = 280
+CHART_SPREAD_H = 150
+CHART_PANEL_GAP = 42
+CHART_HEIGHT = (
+    CHART_PAD_TOP + CHART_PRICE_H + CHART_PANEL_GAP + CHART_SPREAD_H + CHART_PAD_BOTTOM
+)
+MAGENTA = "\033[95m"
 ONE = Decimal("1")
 PRICE_QUANT = Decimal("0.0001")
 SIZE_QUANT = Decimal("0.01")
@@ -101,6 +107,12 @@ def parse_levels(levels: Any) -> list[tuple[Decimal, str]]:
 
 def format_price(price: Decimal) -> str:
     return f"{price.quantize(PRICE_QUANT)}"
+
+
+def decimal_spread(bid: Decimal | None, ask: Decimal | None) -> Decimal | None:
+    if isinstance(bid, Decimal) and isinstance(ask, Decimal):
+        return ask - bid
+    return None
 
 
 def as_pairs(levels: list[tuple[Decimal, str]], *, best_first: bool = False) -> list[list[str]]:
@@ -187,6 +199,9 @@ def summarize_market(market: Mapping[str, Any], book: Mapping[str, Any]) -> dict
     yes_ask_total = size_total(yes_ask_pairs)
     no_bid_total = size_total(no_bid_pairs)
     no_ask_total = size_total(no_ask_pairs)
+    bid_px = parse_optional_price(yes_bid_pairs[0] if yes_bid_pairs else None)
+    ask_px = parse_optional_price(yes_ask_pairs[0] if yes_ask_pairs else None)
+    spread = decimal_spread(bid_px, ask_px)
     return {
         "ticker": ticker,
         "status": str(market.get("status") or ""),
@@ -203,6 +218,7 @@ def summarize_market(market: Mapping[str, Any], book: Mapping[str, Any]) -> dict
         "yes_ask_total": format_size(yes_ask_total),
         "no_bid_total": format_size(no_bid_total),
         "no_ask_total": format_size(no_ask_total),
+        "yes_spread": format_price(spread) if spread is not None else None,
         "orderbook": book,
     }
 
@@ -293,6 +309,12 @@ def print_snapshot(
             f"{render_levels(item.get('no_bids'), kind='bid', enabled=color)}",
             file=out,
         )
+        spread = item.get("yes_spread")
+        if spread:
+            print(
+                f"    {paint('spread', MAGENTA, BOLD, enabled=color)}  {spread}",
+                file=out,
+            )
 
 
 def append_jsonl(path: Path, snapshot: Mapping[str, Any]) -> None:
@@ -330,13 +352,16 @@ def append_history(history: dict[str, dict[str, Any]], snapshot: Mapping[str, An
             {"word": str(item.get("word") or ticker), "samples": []},
         )
         series["word"] = str(item.get("word") or series["word"])
+        bid_px = parse_optional_price(item.get("yes_bid"))
+        ask_px = parse_optional_price(item.get("yes_ask"))
         series["samples"].append(
             {
                 "ts": snapshot.get("ts"),
-                "yes_bid": parse_optional_price(item.get("yes_bid")),
-                "yes_ask": parse_optional_price(item.get("yes_ask")),
+                "yes_bid": bid_px,
+                "yes_ask": ask_px,
                 "no_bid": parse_optional_price(item.get("no_bid")),
                 "no_ask": parse_optional_price(item.get("no_ask")),
+                "spread": decimal_spread(bid_px, ask_px),
                 "yes_bid_total": parse_total(item.get("yes_bid_total")),
                 "yes_ask_total": parse_total(item.get("yes_ask_total")),
                 "no_bid_total": parse_total(item.get("no_bid_total")),
@@ -418,6 +443,22 @@ def price_window(samples: list[Mapping[str, Any]]) -> tuple[float, float]:
     return low, high
 
 
+def spread_window(samples: list[Mapping[str, Any]]) -> tuple[float, float]:
+    spreads = [
+        float(sample["spread"])
+        for sample in samples
+        if isinstance(sample.get("spread"), Decimal)
+    ]
+    if not spreads:
+        return 0.0, 0.05
+    low = min(0.0, min(spreads))
+    high = max(spreads)
+    if high - low < 0.01:
+        high = low + 0.02
+    pad = max((high - low) * 0.15, 0.005)
+    return low, high + pad
+
+
 def _price_points(
     samples: list[Mapping[str, Any]],
     field: str,
@@ -459,6 +500,39 @@ def _svg_polyline(points: list[tuple[float, float]], color: str, width: float = 
     )
 
 
+def _svg_band(bid_pts: list[tuple[float, float]], ask_pts: list[tuple[float, float]]) -> str:
+    if len(bid_pts) < 2 or len(bid_pts) != len(ask_pts):
+        return ""
+    points = bid_pts + list(reversed(ask_pts))
+    joined = " ".join(f"{x:.2f},{y:.2f}" for x, y in points)
+    return f'<polygon fill="#ffd15c" fill-opacity="0.18" stroke="none" points="{joined}"/>'
+
+
+def _y_axis(
+    parts: list[str],
+    *,
+    left: float,
+    top: float,
+    plot_w: float,
+    plot_h: float,
+    y_min: float,
+    y_max: float,
+) -> None:
+    span = y_max - y_min
+    for step in range(5):
+        frac = step / 4
+        value = y_max - frac * span
+        y = top + frac * plot_h
+        parts.append(
+            f'<line x1="{left}" y1="{y:.2f}" x2="{left + plot_w}" y2="{y:.2f}" '
+            f'stroke="#2a2a2a"/>'
+        )
+        parts.append(
+            f'<text x="{left - 8}" y="{y + 4:.2f}" fill="#cccccc" font-size="12" '
+            f'text-anchor="end">{format_axis_price(value, span)}</text>'
+        )
+
+
 def render_market_svg(
     ticker: str,
     payload: Mapping[str, Any],
@@ -466,18 +540,22 @@ def render_market_svg(
     *,
     tz: tzinfo | None = None,
 ) -> str:
-    """One market: YES bid (cyan) and YES ask (yellow) vs local time."""
+    """One market: YES bid/ask plus spread vs local time."""
     samples = list(payload.get("samples") or [])
     word = str(payload.get("word") or ticker)
     last = samples[-1] if samples else {}
     bid_tot = format_size(parse_total(last.get("yes_bid_total"))) if last else "0.00"
     ask_tot = format_size(parse_total(last.get("yes_ask_total"))) if last else "0.00"
+    last_spread = last.get("spread") if last else None
+    spread_label = format_price(last_spread) if isinstance(last_spread, Decimal) else "-"
     y_min, y_max = price_window(samples)
-    span = y_max - y_min
+    s_min, s_max = spread_window(samples)
     width, height = CHART_WIDTH, CHART_HEIGHT
-    left, top = CHART_PAD_LEFT, CHART_PAD_TOP
+    left = CHART_PAD_LEFT
     plot_w = width - CHART_PAD_LEFT - CHART_PAD_RIGHT
-    plot_h = height - CHART_PAD_TOP - CHART_PAD_BOTTOM
+    price_top = CHART_PAD_TOP
+    spread_top = CHART_PAD_TOP + CHART_PRICE_H + CHART_PANEL_GAP
+    zone = tz if tz is not None else local_timezone()
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}" role="img">',
@@ -489,26 +567,29 @@ def render_market_svg(
         f"{html.escape(ticker)}</text>",
         '<text x="24" y="74" fill="#5ce1ff" font-size="13">YES bid</text>',
         '<text x="110" y="74" fill="#ffd15c" font-size="13">YES ask</text>',
+        '<text x="196" y="74" fill="#ff79c6" font-size="13">spread</text>',
         f'<text x="{width - 24}" y="32" fill="#aaaaaa" font-size="13" text-anchor="end">'
-        f"n={len(samples)}  bid tot {bid_tot}  ask tot {ask_tot}</text>",
-        f'<rect x="{left}" y="{top}" width="{plot_w}" height="{plot_h}" '
+        f"n={len(samples)}  bid tot {bid_tot}  ask tot {ask_tot}  spread {spread_label}</text>",
+        f'<rect x="{left}" y="{price_top}" width="{plot_w}" height="{CHART_PRICE_H}" '
+        f'fill="#191919" stroke="#333333"/>',
+        f'<rect x="{left}" y="{spread_top}" width="{plot_w}" height="{CHART_SPREAD_H}" '
         f'fill="#191919" stroke="#333333"/>',
     ]
-    for step in range(5):
-        frac = step / 4
-        price = y_max - frac * span
-        y = top + frac * plot_h
-        parts.append(
-            f'<line x1="{left}" y1="{y:.2f}" x2="{left + plot_w}" y2="{y:.2f}" '
-            f'stroke="#2a2a2a"/>'
-        )
-        parts.append(
-            f'<text x="{left - 8}" y="{y + 4:.2f}" fill="#cccccc" font-size="12" '
-            f'text-anchor="end">{format_axis_price(price, span)}</text>'
-        )
+    _y_axis(
+        parts, left=left, top=price_top, plot_w=plot_w, plot_h=CHART_PRICE_H,
+        y_min=y_min, y_max=y_max,
+    )
+    _y_axis(
+        parts, left=left, top=spread_top, plot_w=plot_w, plot_h=CHART_SPREAD_H,
+        y_min=s_min, y_max=s_max,
+    )
     parts.append(
-        f'<text x="18" y="{top + plot_h / 2:.1f}" fill="#dddddd" font-size="13" '
-        f'transform="rotate(-90 18 {top + plot_h / 2:.1f})">YES price ($)</text>'
+        f'<text x="18" y="{price_top + CHART_PRICE_H / 2:.1f}" fill="#dddddd" font-size="13" '
+        f'transform="rotate(-90 18 {price_top + CHART_PRICE_H / 2:.1f})">YES price ($)</text>'
+    )
+    parts.append(
+        f'<text x="18" y="{spread_top + CHART_SPREAD_H / 2:.1f}" fill="#ff79c6" font-size="13" '
+        f'transform="rotate(-90 18 {spread_top + CHART_SPREAD_H / 2:.1f})">Spread ($)</text>'
     )
     tick_count = min(6, max(len(samples), 1))
     if samples:
@@ -522,33 +603,40 @@ def render_market_svg(
         for index in indexes:
             x = left + (index / span_x) * plot_w
             parts.append(
-                f'<line x1="{x:.2f}" y1="{top}" x2="{x:.2f}" y2="{top + plot_h}" '
-                f'stroke="#2a2a2a"/>'
+                f'<line x1="{x:.2f}" y1="{price_top}" x2="{x:.2f}" '
+                f'y2="{price_top + CHART_PRICE_H}" stroke="#2a2a2a"/>'
             )
             parts.append(
-                f'<text x="{x:.2f}" y="{top + plot_h + 22}" fill="#cccccc" font-size="12" '
-                f'text-anchor="middle">{html.escape(format_axis_time(samples[index].get("ts"), tz=tz))}</text>'
+                f'<line x1="{x:.2f}" y1="{spread_top}" x2="{x:.2f}" '
+                f'y2="{spread_top + CHART_SPREAD_H}" stroke="#2a2a2a"/>'
             )
-    zone = tz if tz is not None else local_timezone()
+            parts.append(
+                f'<text x="{x:.2f}" y="{spread_top + CHART_SPREAD_H + 22}" fill="#cccccc" '
+                f'font-size="12" text-anchor="middle">'
+                f'{html.escape(format_axis_time(samples[index].get("ts"), tz=tz))}</text>'
+            )
     parts.append(
         f'<text x="{left + plot_w / 2:.1f}" y="{height - 16}" fill="#dddddd" '
         f'font-size="13" text-anchor="middle">Time ({html.escape(tz_abbrev(zone))})</text>'
     )
+    bid_pts = _price_points(
+        samples, "yes_bid", left=left, top=price_top, width=plot_w, height=CHART_PRICE_H,
+        y_min=y_min, y_max=y_max,
+    )
+    ask_pts = _price_points(
+        samples, "yes_ask", left=left, top=price_top, width=plot_w, height=CHART_PRICE_H,
+        y_min=y_min, y_max=y_max,
+    )
+    parts.append(_svg_band(bid_pts, ask_pts))
+    parts.append(_svg_polyline(ask_pts, "#ffd15c", 2.2))
+    parts.append(_svg_polyline(bid_pts, "#5ce1ff", 2.2))
     parts.append(_svg_polyline(
         _price_points(
-            samples, "yes_ask", left=left, top=top, width=plot_w, height=plot_h,
-            y_min=y_min, y_max=y_max,
+            samples, "spread", left=left, top=spread_top, width=plot_w, height=CHART_SPREAD_H,
+            y_min=s_min, y_max=s_max,
         ),
-        "#ffd15c",
-        2.2,
-    ))
-    parts.append(_svg_polyline(
-        _price_points(
-            samples, "yes_bid", left=left, top=top, width=plot_w, height=plot_h,
-            y_min=y_min, y_max=y_max,
-        ),
-        "#5ce1ff",
-        2.2,
+        "#ff79c6",
+        2.4,
     ))
     parts.append("</svg>")
     return "\n".join(part for part in parts if part)
