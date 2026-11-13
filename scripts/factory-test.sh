@@ -8,6 +8,7 @@ python_bin="${PYTHON_BIN:-python3}"
 stable_entry=mention_scout.py
 resolved_entry=kalshi_mention_scout.py
 markets_entry=mention_markets.py
+orderbook_entry=mm-orderbook-watch
 
 [[ -e "$stable_entry" || -L "$stable_entry" ]] || {
     echo "Stable entry not found: $stable_entry" >&2
@@ -21,14 +22,22 @@ markets_entry=mention_markets.py
     echo "Mention markets entry not found: $markets_entry" >&2
     exit 2
 }
+[[ -e "$orderbook_entry" || -L "$orderbook_entry" ]] || {
+    echo "Orderbook watch entry not found: $orderbook_entry" >&2
+    exit 2
+}
 
 resolved="$(readlink -f "$resolved_entry")"
 echo "Compile: $resolved"
 "$python_bin" -m py_compile "$resolved"
 echo "Compile: $markets_entry"
 "$python_bin" -m py_compile "$markets_entry"
+echo "Compile: mm_orderbook_watch.py"
+"$python_bin" -m py_compile mm_orderbook_watch.py
+echo "Compile: $orderbook_entry"
+"$python_bin" -m py_compile "$orderbook_entry"
 
-for entry in "$stable_entry" "$resolved_entry" "$markets_entry"; do
+for entry in "$stable_entry" "$resolved_entry" "$markets_entry" "$orderbook_entry"; do
     echo "CLI smoke test: ./$entry --help"
     "$python_bin" "$entry" --help >/dev/null
     echo "CLI smoke test: ./$entry --version"

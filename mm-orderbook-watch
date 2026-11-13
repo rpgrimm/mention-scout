@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Poll Kalshi until markets open, then dump public order books. Discovery only."""
+
+from __future__ import annotations
+
+import sys
+
+from mm_orderbook_watch import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())
