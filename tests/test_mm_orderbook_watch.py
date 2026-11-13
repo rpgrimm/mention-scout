@@ -140,6 +140,12 @@ def test_wait_then_dump_orderbook_once(tmp_path: Path, capsys: pytest.CaptureFix
     assert market["no_bid_total"] == "40.00"
     assert market["no_ask_total"] == "110.00"
     assert "\033" not in lines[0]
+    chart = log_path.with_suffix(".svg")
+    svg = chart.read_text(encoding="utf-8")
+    assert svg.startswith("<svg")
+    assert "YES bid" in svg
+    assert "AI / Artificial Intelligence" in svg
+    assert "circle" in svg or "polyline" in svg
 
 
 def test_complement_asks_are_one_minus_bid() -> None:
@@ -195,6 +201,47 @@ def test_default_ticker_from_date(tmp_path: Path) -> None:
     )
     assert code == 0
     assert "event_ticker=KXWORLDNEWSMENTION-26NOV13" in fake.calls[0]
+
+
+def test_history_chart_polyline_over_time(tmp_path: Path) -> None:
+    history: dict[str, dict] = {}
+    first = {
+        "ts": "2026-11-13T18:30:01Z",
+        "markets": [
+            {
+                "ticker": "KXWORLDNEWSMENTION-26NOV13-AI",
+                "word": "AI / Artificial Intelligence",
+                "yes_bid": ["0.4200", "100.00"],
+                "yes_ask": ["0.4500", "40.00"],
+                "yes_bid_total": "110.00",
+                "yes_ask_total": "40.00",
+            }
+        ],
+    }
+    second = {
+        "ts": "2026-11-13T18:30:02Z",
+        "markets": [
+            {
+                "ticker": "KXWORLDNEWSMENTION-26NOV13-AI",
+                "word": "AI / Artificial Intelligence",
+                "yes_bid": ["0.4300", "80.00"],
+                "yes_ask": ["0.4600", "50.00"],
+                "yes_bid_total": "90.00",
+                "yes_ask_total": "50.00",
+            }
+        ],
+    }
+    watch.append_history(history, first)
+    watch.append_history(history, second)
+    svg = watch.render_history_svg(history, "KXWORLDNEWSMENTION-26NOV13")
+    assert "polyline" in svg
+    assert "#5ce1ff" in svg
+    assert "#ffd15c" in svg
+    assert "bid tot 90.00" in svg
+    path = tmp_path / "chart.svg"
+    watch.write_history_chart(path, history, "KXWORLDNEWSMENTION-26NOV13")
+    assert path.read_text(encoding="utf-8") == svg
+    assert not path.with_name(path.name + ".tmp").exists()
 
 
 def test_help_and_version() -> None:

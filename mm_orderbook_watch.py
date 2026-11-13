@@ -7,6 +7,7 @@ Discovery only. Never places, modifies, or cancels orders. Public GET only.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import sys
@@ -19,7 +20,13 @@ from urllib.parse import urlencode
 
 import mention_markets as mm
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
+CHART_PANEL_WIDTH = 960
+CHART_PANEL_HEIGHT = 88
+CHART_PAD_LEFT = 44
+CHART_PAD_RIGHT = 16
+CHART_PAD_TOP = 22
+CHART_PAD_BOTTOM = 10
 ONE = Decimal("1")
 PRICE_QUANT = Decimal("0.0001")
 SIZE_QUANT = Decimal("0.01")
@@ -293,6 +300,174 @@ def append_jsonl(path: Path, snapshot: Mapping[str, Any]) -> None:
         handle.write(json.dumps(snapshot, separators=(",", ":")) + "\n")
 
 
+def parse_optional_price(pair: Any) -> Decimal | None:
+    if isinstance(pair, (list, tuple)) and pair:
+        try:
+            return Decimal(str(pair[0]))
+        except (InvalidOperation, ValueError):
+            return None
+    return None
+
+
+def parse_total(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value or "0"))
+    except (InvalidOperation, ValueError):
+        return Decimal("0")
+
+
+def append_history(history: dict[str, dict[str, Any]], snapshot: Mapping[str, Any]) -> None:
+    """Keep per-market bid/ask samples as dumps arrive."""
+    for item in snapshot.get("markets") or []:
+        if not isinstance(item, dict) or item.get("error"):
+            continue
+        ticker = str(item.get("ticker") or "").strip()
+        if not ticker:
+            continue
+        series = history.setdefault(
+            ticker,
+            {"word": str(item.get("word") or ticker), "samples": []},
+        )
+        series["word"] = str(item.get("word") or series["word"])
+        series["samples"].append(
+            {
+                "ts": snapshot.get("ts"),
+                "yes_bid": parse_optional_price(item.get("yes_bid")),
+                "yes_ask": parse_optional_price(item.get("yes_ask")),
+                "no_bid": parse_optional_price(item.get("no_bid")),
+                "no_ask": parse_optional_price(item.get("no_ask")),
+                "yes_bid_total": parse_total(item.get("yes_bid_total")),
+                "yes_ask_total": parse_total(item.get("yes_ask_total")),
+                "no_bid_total": parse_total(item.get("no_bid_total")),
+                "no_ask_total": parse_total(item.get("no_ask_total")),
+            }
+        )
+
+
+def _price_points(
+    samples: list[Mapping[str, Any]],
+    field: str,
+    *,
+    left: float,
+    top: float,
+    width: float,
+    height: float,
+) -> list[tuple[float, float]]:
+    count = len(samples)
+    if count == 0:
+        return []
+    span = max(count - 1, 1)
+    points: list[tuple[float, float]] = []
+    for index, sample in enumerate(samples):
+        price = sample.get(field)
+        if not isinstance(price, Decimal):
+            continue
+        clamped = min(max(float(price), 0.0), 1.0)
+        x = left + (index / span) * width
+        y = top + (1.0 - clamped) * height
+        points.append((x, y))
+    return points
+
+
+def _svg_polyline(points: list[tuple[float, float]], color: str, width: float = 1.6) -> str:
+    if not points:
+        return ""
+    if len(points) == 1:
+        x, y = points[0]
+        return f'<circle cx="{x:.2f}" cy="{y:.2f}" r="3" fill="{color}"/>'
+    joined = " ".join(f"{x:.2f},{y:.2f}" for x, y in points)
+    return (
+        f'<polyline fill="none" stroke="{color}" stroke-width="{width}" '
+        f'stroke-linejoin="round" points="{joined}"/>'
+    )
+
+
+def render_history_svg(history: Mapping[str, dict[str, Any]], event_ticker: str) -> str:
+    """Small-multiples SVG: YES bid (cyan) and YES ask (yellow) vs time."""
+    series = sorted(
+        history.items(),
+        key=lambda item: str(item[1].get("word") or item[0]).casefold(),
+    )
+    header = 56
+    height = header + max(len(series), 1) * CHART_PANEL_HEIGHT + 24
+    width = CHART_PANEL_WIDTH
+    plot_w = width - CHART_PAD_LEFT - CHART_PAD_RIGHT
+    plot_h = CHART_PANEL_HEIGHT - CHART_PAD_TOP - CHART_PAD_BOTTOM
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}" role="img">',
+        "<style>text{font-family:DejaVu Sans,Liberation Sans,sans-serif;}</style>",
+        f'<rect width="{width}" height="{height}" fill="#111111"/>',
+        f'<text x="16" y="22" fill="#eeeeee" font-size="16" font-weight="700">'
+        f"{html.escape(event_ticker)} YES bid/ask</text>",
+        '<text x="16" y="40" fill="#5ce1ff" font-size="12">YES bid</text>',
+        '<text x="88" y="40" fill="#ffd15c" font-size="12">YES ask</text>',
+        f'<text x="{width - 16}" y="22" fill="#aaaaaa" font-size="12" text-anchor="end">'
+        f"samples={max((len(item[1].get('samples') or []) for item in series), default=0)}  "
+        "open in eog</text>",
+    ]
+    if not series:
+        parts.append('<text x="16" y="80" fill="#888888">no samples yet</text>')
+        parts.append("</svg>")
+        return "\n".join(parts)
+
+    for index, (ticker, payload) in enumerate(series):
+        top = header + index * CHART_PANEL_HEIGHT
+        samples = list(payload.get("samples") or [])
+        word = html.escape(str(payload.get("word") or ticker))
+        last = samples[-1] if samples else {}
+        bid_tot = format_size(parse_total(last.get("yes_bid_total"))) if last else "0.00"
+        ask_tot = format_size(parse_total(last.get("yes_ask_total"))) if last else "0.00"
+        parts.append(
+            f'<rect x="8" y="{top}" width="{width - 16}" height="{CHART_PANEL_HEIGHT - 4}" '
+            f'rx="6" fill="#1a1a1a" stroke="#2a2a2a"/>'
+        )
+        parts.append(
+            f'<text x="16" y="{top + 14}" fill="#dddddd" font-size="12" font-weight="700">'
+            f"{word}</text>"
+        )
+        parts.append(
+            f'<text x="{width - 16}" y="{top + 14}" fill="#888888" font-size="11" '
+            f'text-anchor="end">{html.escape(ticker)}  bid tot {bid_tot}  ask tot {ask_tot}</text>'
+        )
+        axis_top = top + CHART_PAD_TOP
+        axis_left = CHART_PAD_LEFT
+        parts.append(
+            f'<line x1="{axis_left}" y1="{axis_top}" x2="{axis_left}" '
+            f'y2="{axis_top + plot_h}" stroke="#333333"/>'
+        )
+        parts.append(
+            f'<line x1="{axis_left}" y1="{axis_top + plot_h}" x2="{axis_left + plot_w}" '
+            f'y2="{axis_top + plot_h}" stroke="#333333"/>'
+        )
+        parts.append(
+            f'<text x="{axis_left - 6}" y="{axis_top + 4}" fill="#666666" font-size="9" '
+            f'text-anchor="end">1</text>'
+        )
+        parts.append(
+            f'<text x="{axis_left - 6}" y="{axis_top + plot_h}" fill="#666666" font-size="9" '
+            f'text-anchor="end">0</text>'
+        )
+        ask_pts = _price_points(
+            samples, "yes_ask", left=axis_left, top=axis_top, width=plot_w, height=plot_h
+        )
+        bid_pts = _price_points(
+            samples, "yes_bid", left=axis_left, top=axis_top, width=plot_w, height=plot_h
+        )
+        parts.append(_svg_polyline(ask_pts, "#ffd15c", 1.8))
+        parts.append(_svg_polyline(bid_pts, "#5ce1ff", 1.8))
+    parts.append("</svg>")
+    return "\n".join(part for part in parts if part)
+
+
+def write_history_chart(path: Path, history: Mapping[str, dict[str, Any]], event_ticker: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    svg = render_history_svg(history, event_ticker)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(svg, encoding="utf-8")
+    tmp.replace(path)
+
+
 def build_snapshot(
     event_ticker: str,
     markets: list[dict[str, Any]],
@@ -342,6 +517,7 @@ def run_watch(
     *,
     interval: float,
     log_path: Path,
+    chart_path: Path | None,
     depth: int,
     max_wait: int,
     max_dumps: int,
@@ -365,9 +541,15 @@ def run_watch(
         "(GET only; no orders)",
         file=err,
     )
+    if chart_path is not None:
+        print(
+            f"chart: {chart_path}  (eog {chart_path}   or   feh --reload 1 {chart_path})",
+            file=err,
+        )
     opened = False
     wait_polls = 0
     dump_polls = 0
+    history: dict[str, dict[str, Any]] = {}
     while True:
         markets = mm.fetch_markets_rest_paginated(
             ticker,
@@ -414,6 +596,9 @@ def run_watch(
         print_snapshot(snapshot, file=out, color=want_color(out, color_mode))
         out.flush()
         append_jsonl(log_path, snapshot)
+        append_history(history, snapshot)
+        if chart_path is not None:
+            write_history_chart(chart_path, history, ticker)
         dump_polls += 1
         if max_dumps and dump_polls >= max_dumps:
             return 0
@@ -452,6 +637,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="JSONL log path (default: ./orderbook-EVENT.jsonl)",
+    )
+    parser.add_argument(
+        "--chart",
+        type=Path,
+        default=None,
+        help="SVG chart path rewritten each dump (default: ./orderbook-EVENT.svg)",
+    )
+    parser.add_argument(
+        "--no-chart",
+        action="store_true",
+        help="Do not write an SVG chart",
     )
     parser.add_argument(
         "--depth",
@@ -503,12 +699,19 @@ def main(
             print("--date must be YYYY-MM-DD", file=sys.stderr)
             return 1
     ticker = mm.kalshi_event_ticker(args.event_ticker) if args.event_ticker else world_news_event_ticker(when)
-    log_path = args.log if args.log is not None else Path(f"orderbook-{ticker}.jsonl")
+    log_path = (args.log if args.log is not None else Path(f"orderbook-{ticker}.jsonl")).expanduser()
+    if args.no_chart:
+        chart_path: Path | None = None
+    elif args.chart is not None:
+        chart_path = args.chart.expanduser()
+    else:
+        chart_path = log_path.with_suffix(".svg")
     try:
         return run_watch(
             ticker,
             interval=float(args.interval),
-            log_path=log_path.expanduser(),
+            log_path=log_path,
+            chart_path=chart_path,
             depth=int(args.depth),
             max_wait=int(args.max_wait),
             max_dumps=int(args.max_dumps),
