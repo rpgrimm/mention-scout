@@ -40,6 +40,11 @@ Changes in v10:
   * Bumps the cache format so a v9 compact cache is rebuilt once with the
     corrected query-status marker.
 
+Changes in v16.12 / MS-0028:
+  * ``mm-orderbook-watch`` polls a Kalshi event every second until markets are
+    active/open, then prints and JSONL-logs the public order book every second.
+    GET only — does not place orders.
+
 Changes in v16.9 / MS-0025:
   * ``mention_markets.py target`` uppercases the event ticker before the Kalshi GET
     (``kxmamdanimention-26nov08`` → ``KXMAMDANIMENTION-26NOV08``).
@@ -164,7 +169,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-VERSION = "16.9.0"
+VERSION = "16.12.0"
 CACHE_FORMAT_VERSION = 5
 DEFAULT_MENTION_CACHE_FILE = ".kalshi_mention_scout_mentions_cache.json"
 DEFAULT_FULL_CACHE_FILE = ".kalshi_mention_scout_full_cache.json"

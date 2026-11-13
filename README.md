@@ -316,6 +316,16 @@ Search **mode** defaults from the event ticker (`--mode auto`):
 
 Slash phrases become a single query (`OpenAI / Anthropic` → spaces). Tabs open **2 seconds apart** by default (`--sleep 2`). Use `--json PATH` for a fixture. `--dry-run` never opens a browser.
 
+### Order-book watch
+
+`./mm-orderbook-watch` polls public Kalshi REST every second until the event's markets are `active`/`open`, then prints the book and appends JSONL. **GET only — no orders.**
+
+```bash
+./mm-orderbook-watch                         # today's KXWORLDNEWSMENTION-YYMONDD
+./mm-orderbook-watch KXWORLDNEWSMENTION-26NOV13
+./mm-orderbook-watch KXWORLDNEWSMENTION-26NOV13 --log ./orderbook.jsonl
+```
+
 ## Project layout
 
 | Path | Role |
@@ -323,6 +333,7 @@ Slash phrases become a single query (`OpenAI / Anthropic` → spaces). Tabs open
 | `./mention_scout.py` | Stable entry (symlink) |
 | `kalshi_mention_scout.py` | Implementation (v16) |
 | `./mention_markets.py` | Calendar-added events → Google News tabs (MS-0016) |
+| `./mm-orderbook-watch` | Poll until open, dump public order books (MS-0028) |
 | `deploy/systemd/` | User unit template (placeholders) |
 | `deploy/config/calendar-matches.example.json` | Example calendar phrase list (copy to `~/.config/mention-scout/`) |
 | `scripts/install-user-service.sh` | Install/update/disable user watch unit |
