@@ -11,13 +11,16 @@ import json
 import sys
 import time
 from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Mapping, TextIO
 from urllib.parse import urlencode
 
 import mention_markets as mm
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+ONE = Decimal("1")
+PRICE_QUANT = Decimal("0.0001")
 DEFAULT_INTERVAL = 1.0
 OPEN_STATUSES = frozenset({"active", "open"})
 ENGLISH_MONTH_ABBREV = (
@@ -61,14 +64,55 @@ def is_open_status(market: Mapping[str, Any]) -> bool:
     return str(market.get("status") or "").casefold() in OPEN_STATUSES
 
 
-def best_level(levels: Any) -> tuple[str, str] | None:
-    """Kalshi books are ascending; the best bid is the last [price, size] pair."""
-    if not isinstance(levels, list) or not levels:
-        return None
-    last = levels[-1]
-    if isinstance(last, (list, tuple)) and len(last) >= 2:
-        return str(last[0]), str(last[1])
-    return None
+def parse_levels(levels: Any) -> list[tuple[Decimal, str]]:
+    """Parse Kalshi [price, size] rows. Bids arrive ascending (best last)."""
+    parsed: list[tuple[Decimal, str]] = []
+    if not isinstance(levels, list):
+        return parsed
+    for item in levels:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            price = Decimal(str(item[0]))
+        except (InvalidOperation, ValueError):
+            continue
+        parsed.append((price, str(item[1])))
+    return parsed
+
+
+def format_price(price: Decimal) -> str:
+    return f"{price.quantize(PRICE_QUANT)}"
+
+
+def as_pairs(levels: list[tuple[Decimal, str]], *, best_first: bool = False) -> list[list[str]]:
+    rows = list(reversed(levels)) if best_first else list(levels)
+    return [[format_price(price), size] for price, size in rows]
+
+
+def complement_asks(bid_levels: list[tuple[Decimal, str]]) -> list[tuple[Decimal, str]]:
+    """A bid on one side at p is an ask on the other at 1-p. Lowest ask first."""
+    asks = [(ONE - price, size) for price, size in bid_levels]
+    asks.sort(key=lambda item: item[0])
+    return asks
+
+
+def format_levels(levels: list[tuple[Decimal, str]], *, best_first: bool = False) -> str:
+    rows = as_pairs(levels, best_first=best_first)
+    if not rows:
+        return "-"
+    return "  ".join(f"{price} x {size}" for price, size in rows)
+
+
+def extract_bid_levels(book: Mapping[str, Any]) -> tuple[list[tuple[Decimal, str]], list[tuple[Decimal, str]]]:
+    fp = book.get("orderbook_fp") if isinstance(book.get("orderbook_fp"), dict) else {}
+    if isinstance(fp, dict) and (
+        fp.get("yes_dollars") is not None or fp.get("no_dollars") is not None
+    ):
+        return parse_levels(fp.get("yes_dollars")), parse_levels(fp.get("no_dollars"))
+    raw = book.get("orderbook") if isinstance(book.get("orderbook"), dict) else {}
+    if isinstance(raw, dict):
+        return parse_levels(raw.get("yes")), parse_levels(raw.get("no"))
+    return [], []
 
 
 def orderbook_url(market_ticker: str, *, depth: int) -> str:
@@ -94,24 +138,28 @@ def fetch_orderbook(
 
 
 def summarize_market(market: Mapping[str, Any], book: Mapping[str, Any]) -> dict[str, Any]:
-    fp = book.get("orderbook_fp") if isinstance(book.get("orderbook_fp"), dict) else {}
-    yes_levels = fp.get("yes_dollars") if isinstance(fp, dict) else None
-    no_levels = fp.get("no_dollars") if isinstance(fp, dict) else None
+    yes_bids, no_bids = extract_bid_levels(book)
+    yes_asks = complement_asks(no_bids)
+    no_asks = complement_asks(yes_bids)
     ticker = str(market.get("ticker") or "").strip()
+    yes_bid_pairs = as_pairs(yes_bids, best_first=True)
+    yes_ask_pairs = as_pairs(yes_asks)
+    no_bid_pairs = as_pairs(no_bids, best_first=True)
+    no_ask_pairs = as_pairs(no_asks)
     return {
         "ticker": ticker,
         "status": str(market.get("status") or ""),
         "word": mm.market_word(dict(market)).strip(),
-        "yes_best": best_level(yes_levels),
-        "no_best": best_level(no_levels),
+        "yes_bids": yes_bid_pairs,
+        "yes_asks": yes_ask_pairs,
+        "no_bids": no_bid_pairs,
+        "no_asks": no_ask_pairs,
+        "yes_bid": yes_bid_pairs[0] if yes_bid_pairs else None,
+        "yes_ask": yes_ask_pairs[0] if yes_ask_pairs else None,
+        "no_bid": no_bid_pairs[0] if no_bid_pairs else None,
+        "no_ask": no_ask_pairs[0] if no_ask_pairs else None,
         "orderbook": book,
     }
-
-
-def format_best(pair: tuple[str, str] | None) -> str:
-    if pair is None:
-        return "-"
-    return f"{pair[0]} x {pair[1]}"
 
 
 def print_snapshot(snapshot: Mapping[str, Any], *, file: TextIO | None = None) -> None:
@@ -129,11 +177,23 @@ def print_snapshot(snapshot: Mapping[str, Any], *, file: TextIO | None = None) -
             print(f"  {item.get('word') or '?'}  {item.get('ticker')}  ERROR {err}", file=out)
             continue
         print(
-            f"  {item.get('word') or '?'}  {item.get('ticker')}  "
-            f"status={item.get('status')}  yes={format_best(item.get('yes_best'))}  "
-            f"no={format_best(item.get('no_best'))}",
+            f"  {item.get('word') or '?'}  {item.get('ticker')}  status={item.get('status')}",
             file=out,
         )
+        print(f"    YES ask  {_join_pairs(item.get('yes_asks'))}", file=out)
+        print(f"    YES bid  {_join_pairs(item.get('yes_bids'))}", file=out)
+        print(f"    NO  ask  {_join_pairs(item.get('no_asks'))}", file=out)
+        print(f"    NO  bid  {_join_pairs(item.get('no_bids'))}", file=out)
+
+
+def _join_pairs(pairs: Any) -> str:
+    if not isinstance(pairs, list) or not pairs:
+        return "-"
+    rendered: list[str] = []
+    for item in pairs:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            rendered.append(f"{item[0]} x {item[1]}")
+    return "  ".join(rendered) if rendered else "-"
 
 
 def append_jsonl(path: Path, snapshot: Mapping[str, Any]) -> None:

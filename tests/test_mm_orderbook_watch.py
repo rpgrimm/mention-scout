@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request
@@ -116,14 +117,27 @@ def test_wait_then_dump_orderbook_once(tmp_path: Path, capsys: pytest.CaptureFix
     captured = capsys.readouterr()
     assert "waiting for open" in captured.err
     assert "dumping order books" in captured.err
-    assert "yes=0.4200 x 100.00" in captured.out
-    assert "no=0.5500 x 40.00" in captured.out
+    assert "YES ask  0.4500 x 40.00" in captured.out
+    assert "YES bid  0.4200 x 100.00  0.4000 x 10.00" in captured.out
+    assert "NO  ask  0.5800 x 100.00  0.6000 x 10.00" in captured.out
+    assert "NO  bid  0.5500 x 40.00" in captured.out
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     payload = json.loads(lines[0])
     assert payload["event_ticker"] == "KXWORLDNEWSMENTION-26NOV13"
     assert payload["open_count"] == 1
-    assert payload["markets"][0]["yes_best"] == ["0.4200", "100.00"]
+    market = payload["markets"][0]
+    assert market["yes_bid"] == ["0.4200", "100.00"]
+    assert market["yes_ask"] == ["0.4500", "40.00"]
+    assert market["no_bid"] == ["0.5500", "40.00"]
+    assert market["no_ask"] == ["0.5800", "100.00"]
+
+
+def test_complement_asks_are_one_minus_bid() -> None:
+    bids = [(Decimal("0.4200"), "100.00"), (Decimal("0.4000"), "10.00")]
+    asks = watch.complement_asks(bids)
+    assert asks[0] == (Decimal("0.5800"), "100.00")
+    assert asks[1] == (Decimal("0.6000"), "10.00")
 
 
 def test_still_initialized_exits_after_max_wait(
