@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlparse
@@ -146,9 +147,15 @@ def test_wait_then_dump_orderbook_once(tmp_path: Path, capsys: pytest.CaptureFix
     assert svg.startswith("<svg")
     assert "YES bid" in svg
     assert "YES price ($)" in svg
-    assert "Time (UTC)" in svg
+    assert "Time (UTC)" not in svg
+    assert f"Time ({watch.tz_abbrev()})" in svg
     assert "AI / Artificial Intelligence" in svg
     assert "circle" in svg or "polyline" in svg
+
+
+def test_format_axis_time_uses_local_timezone() -> None:
+    ny = ZoneInfo("America/New_York")
+    assert watch.format_axis_time("2026-11-13T19:04:00Z", tz=ny) == "14:04:00"
 
 
 def test_complement_asks_are_one_minus_bid() -> None:
@@ -242,9 +249,14 @@ def test_history_chart_polyline_over_time(tmp_path: Path) -> None:
     assert "#5ce1ff" in svg
     assert "#ffd15c" in svg
     assert "YES price ($)" in svg
-    assert "Time (UTC)" in svg
-    assert "18:30:01" in svg
-    assert "18:30:02" in svg
+    assert "Time (UTC)" not in svg
+    ny = ZoneInfo("America/New_York")
+    svg_ny = watch.render_market_svg(ticker, history[ticker], "KXWORLDNEWSMENTION-26NOV13", tz=ny)
+    assert "13:30:01" in svg_ny
+    assert "13:30:02" in svg_ny
+    assert "Time (EST)" in svg_ny
+    assert watch.format_axis_time("2026-11-13T18:30:01Z") in svg
+    assert watch.format_axis_time("2026-11-13T18:30:02Z") in svg
     assert "bid tot 90.00" in svg
     chart_dir = tmp_path / "charts"
     written = watch.write_history_charts(chart_dir, history, "KXWORLDNEWSMENTION-26NOV13")

@@ -13,7 +13,7 @@ import os
 import re
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, tzinfo
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Mapping, TextIO
@@ -21,7 +21,7 @@ from urllib.parse import urlencode
 
 import mention_markets as mm
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 CHART_WIDTH = 1100
 CHART_HEIGHT = 620
 CHART_PAD_LEFT = 72
@@ -350,12 +350,41 @@ def chart_filename(ticker: str) -> str:
     return f"{safe}.svg"
 
 
-def format_axis_time(ts: Any) -> str:
-    text = str(ts or "")
-    if "T" in text:
-        clock = text.split("T", 1)[1].replace("Z", "")
-        return clock.split(".")[0]
-    return text or "?"
+def local_timezone() -> tzinfo:
+    tz = datetime.now().astimezone().tzinfo
+    return tz if tz is not None else timezone.utc
+
+
+def parse_iso_ts(ts: Any) -> datetime | None:
+    if isinstance(ts, datetime):
+        return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+    text = str(ts or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def tz_abbrev(tz: tzinfo | None = None) -> str:
+    zone = tz if tz is not None else local_timezone()
+    name = datetime.now(zone).strftime("%Z")
+    return name or "local"
+
+
+def format_axis_time(ts: Any, *, tz: tzinfo | None = None) -> str:
+    """Chart axis clock in local time (JSONL stays UTC)."""
+    parsed = parse_iso_ts(ts)
+    if parsed is None:
+        return str(ts or "?")
+    zone = tz if tz is not None else local_timezone()
+    return parsed.astimezone(zone).strftime("%H:%M:%S")
 
 
 def format_axis_price(value: float, span: float) -> str:
@@ -430,8 +459,14 @@ def _svg_polyline(points: list[tuple[float, float]], color: str, width: float = 
     )
 
 
-def render_market_svg(ticker: str, payload: Mapping[str, Any], event_ticker: str) -> str:
-    """One market: YES bid (cyan) and YES ask (yellow) vs UTC time."""
+def render_market_svg(
+    ticker: str,
+    payload: Mapping[str, Any],
+    event_ticker: str,
+    *,
+    tz: tzinfo | None = None,
+) -> str:
+    """One market: YES bid (cyan) and YES ask (yellow) vs local time."""
     samples = list(payload.get("samples") or [])
     word = str(payload.get("word") or ticker)
     last = samples[-1] if samples else {}
@@ -492,11 +527,12 @@ def render_market_svg(ticker: str, payload: Mapping[str, Any], event_ticker: str
             )
             parts.append(
                 f'<text x="{x:.2f}" y="{top + plot_h + 22}" fill="#cccccc" font-size="12" '
-                f'text-anchor="middle">{html.escape(format_axis_time(samples[index].get("ts")))}</text>'
+                f'text-anchor="middle">{html.escape(format_axis_time(samples[index].get("ts"), tz=tz))}</text>'
             )
+    zone = tz if tz is not None else local_timezone()
     parts.append(
         f'<text x="{left + plot_w / 2:.1f}" y="{height - 16}" fill="#dddddd" '
-        f'font-size="13" text-anchor="middle">Time (UTC)</text>'
+        f'font-size="13" text-anchor="middle">Time ({html.escape(tz_abbrev(zone))})</text>'
     )
     parts.append(_svg_polyline(
         _price_points(
@@ -522,12 +558,15 @@ def write_history_charts(
     chart_dir: Path,
     history: Mapping[str, dict[str, Any]],
     event_ticker: str,
+    *,
+    tz: tzinfo | None = None,
 ) -> list[Path]:
     chart_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
+    zone = tz if tz is not None else local_timezone()
     for ticker, payload in history.items():
         path = chart_dir / chart_filename(str(ticker))
-        svg = render_market_svg(str(ticker), payload, event_ticker)
+        svg = render_market_svg(str(ticker), payload, event_ticker, tz=zone)
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(svg, encoding="utf-8")
         tmp.replace(path)
