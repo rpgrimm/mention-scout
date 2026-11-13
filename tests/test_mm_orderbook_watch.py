@@ -140,10 +140,13 @@ def test_wait_then_dump_orderbook_once(tmp_path: Path, capsys: pytest.CaptureFix
     assert market["no_bid_total"] == "40.00"
     assert market["no_ask_total"] == "110.00"
     assert "\033" not in lines[0]
-    chart = log_path.with_suffix(".svg")
-    svg = chart.read_text(encoding="utf-8")
+    charts = log_path.parent / f"{log_path.stem}-charts"
+    svg_path = charts / "KXWORLDNEWSMENTION-26NOV13-AI.svg"
+    svg = svg_path.read_text(encoding="utf-8")
     assert svg.startswith("<svg")
     assert "YES bid" in svg
+    assert "YES price ($)" in svg
+    assert "Time (UTC)" in svg
     assert "AI / Artificial Intelligence" in svg
     assert "circle" in svg or "polyline" in svg
 
@@ -233,15 +236,21 @@ def test_history_chart_polyline_over_time(tmp_path: Path) -> None:
     }
     watch.append_history(history, first)
     watch.append_history(history, second)
-    svg = watch.render_history_svg(history, "KXWORLDNEWSMENTION-26NOV13")
+    ticker = "KXWORLDNEWSMENTION-26NOV13-AI"
+    svg = watch.render_market_svg(ticker, history[ticker], "KXWORLDNEWSMENTION-26NOV13")
     assert "polyline" in svg
     assert "#5ce1ff" in svg
     assert "#ffd15c" in svg
+    assert "YES price ($)" in svg
+    assert "Time (UTC)" in svg
+    assert "18:30:01" in svg
+    assert "18:30:02" in svg
     assert "bid tot 90.00" in svg
-    path = tmp_path / "chart.svg"
-    watch.write_history_chart(path, history, "KXWORLDNEWSMENTION-26NOV13")
-    assert path.read_text(encoding="utf-8") == svg
-    assert not path.with_name(path.name + ".tmp").exists()
+    chart_dir = tmp_path / "charts"
+    written = watch.write_history_charts(chart_dir, history, "KXWORLDNEWSMENTION-26NOV13")
+    assert written == [chart_dir / "KXWORLDNEWSMENTION-26NOV13-AI.svg"]
+    assert written[0].read_text(encoding="utf-8") == svg
+    assert not (chart_dir / "KXWORLDNEWSMENTION-26NOV13-AI.svg.tmp").exists()
 
 
 def test_help_and_version() -> None:

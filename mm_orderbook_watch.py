@@ -10,6 +10,7 @@ import argparse
 import html
 import json
 import os
+import re
 import sys
 import time
 from datetime import date, datetime, timezone
@@ -20,13 +21,13 @@ from urllib.parse import urlencode
 
 import mention_markets as mm
 
-VERSION = "1.3.0"
-CHART_PANEL_WIDTH = 960
-CHART_PANEL_HEIGHT = 88
-CHART_PAD_LEFT = 44
-CHART_PAD_RIGHT = 16
-CHART_PAD_TOP = 22
-CHART_PAD_BOTTOM = 10
+VERSION = "1.4.0"
+CHART_WIDTH = 1100
+CHART_HEIGHT = 620
+CHART_PAD_LEFT = 72
+CHART_PAD_RIGHT = 28
+CHART_PAD_TOP = 88
+CHART_PAD_BOTTOM = 64
 ONE = Decimal("1")
 PRICE_QUANT = Decimal("0.0001")
 SIZE_QUANT = Decimal("0.01")
@@ -344,6 +345,50 @@ def append_history(history: dict[str, dict[str, Any]], snapshot: Mapping[str, An
         )
 
 
+def chart_filename(ticker: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", ticker).strip("._") or "market"
+    return f"{safe}.svg"
+
+
+def format_axis_time(ts: Any) -> str:
+    text = str(ts or "")
+    if "T" in text:
+        clock = text.split("T", 1)[1].replace("Z", "")
+        return clock.split(".")[0]
+    return text or "?"
+
+
+def format_axis_price(value: float, span: float) -> str:
+    if span < 0.08:
+        return f"{value:.4f}"
+    if span < 0.25:
+        return f"{value:.3f}"
+    return f"{value:.2f}"
+
+
+def price_window(samples: list[Mapping[str, Any]]) -> tuple[float, float]:
+    prices = [
+        float(sample[field])
+        for sample in samples
+        for field in ("yes_bid", "yes_ask")
+        if isinstance(sample.get(field), Decimal)
+    ]
+    if not prices:
+        return 0.0, 1.0
+    low, high = min(prices), max(prices)
+    span = high - low
+    if span < 0.04:
+        mid = (high + low) / 2.0
+        low, high = mid - 0.02, mid + 0.02
+        span = high - low
+    pad = max(span * 0.15, 0.01)
+    low = max(0.0, low - pad)
+    high = min(1.0, high + pad)
+    if high <= low:
+        high = min(1.0, low + 0.05)
+    return low, high
+
+
 def _price_points(
     samples: list[Mapping[str, Any]],
     field: str,
@@ -352,19 +397,22 @@ def _price_points(
     top: float,
     width: float,
     height: float,
+    y_min: float,
+    y_max: float,
 ) -> list[tuple[float, float]]:
     count = len(samples)
     if count == 0:
         return []
-    span = max(count - 1, 1)
+    span_x = max(count - 1, 1)
+    span_y = max(y_max - y_min, 1e-9)
     points: list[tuple[float, float]] = []
     for index, sample in enumerate(samples):
         price = sample.get(field)
         if not isinstance(price, Decimal):
             continue
-        clamped = min(max(float(price), 0.0), 1.0)
-        x = left + (index / span) * width
-        y = top + (1.0 - clamped) * height
+        clamped = min(max(float(price), y_min), y_max)
+        x = left + (index / span_x) * width
+        y = top + (1.0 - (clamped - y_min) / span_y) * height
         points.append((x, y))
     return points
 
@@ -374,7 +422,7 @@ def _svg_polyline(points: list[tuple[float, float]], color: str, width: float = 
         return ""
     if len(points) == 1:
         x, y = points[0]
-        return f'<circle cx="{x:.2f}" cy="{y:.2f}" r="3" fill="{color}"/>'
+        return f'<circle cx="{x:.2f}" cy="{y:.2f}" r="3.5" fill="{color}"/>'
     joined = " ".join(f"{x:.2f},{y:.2f}" for x, y in points)
     return (
         f'<polyline fill="none" stroke="{color}" stroke-width="{width}" '
@@ -382,90 +430,109 @@ def _svg_polyline(points: list[tuple[float, float]], color: str, width: float = 
     )
 
 
-def render_history_svg(history: Mapping[str, dict[str, Any]], event_ticker: str) -> str:
-    """Small-multiples SVG: YES bid (cyan) and YES ask (yellow) vs time."""
-    series = sorted(
-        history.items(),
-        key=lambda item: str(item[1].get("word") or item[0]).casefold(),
-    )
-    header = 56
-    height = header + max(len(series), 1) * CHART_PANEL_HEIGHT + 24
-    width = CHART_PANEL_WIDTH
+def render_market_svg(ticker: str, payload: Mapping[str, Any], event_ticker: str) -> str:
+    """One market: YES bid (cyan) and YES ask (yellow) vs UTC time."""
+    samples = list(payload.get("samples") or [])
+    word = str(payload.get("word") or ticker)
+    last = samples[-1] if samples else {}
+    bid_tot = format_size(parse_total(last.get("yes_bid_total"))) if last else "0.00"
+    ask_tot = format_size(parse_total(last.get("yes_ask_total"))) if last else "0.00"
+    y_min, y_max = price_window(samples)
+    span = y_max - y_min
+    width, height = CHART_WIDTH, CHART_HEIGHT
+    left, top = CHART_PAD_LEFT, CHART_PAD_TOP
     plot_w = width - CHART_PAD_LEFT - CHART_PAD_RIGHT
-    plot_h = CHART_PANEL_HEIGHT - CHART_PAD_TOP - CHART_PAD_BOTTOM
+    plot_h = height - CHART_PAD_TOP - CHART_PAD_BOTTOM
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}" role="img">',
         "<style>text{font-family:DejaVu Sans,Liberation Sans,sans-serif;}</style>",
         f'<rect width="{width}" height="{height}" fill="#111111"/>',
-        f'<text x="16" y="22" fill="#eeeeee" font-size="16" font-weight="700">'
-        f"{html.escape(event_ticker)} YES bid/ask</text>",
-        '<text x="16" y="40" fill="#5ce1ff" font-size="12">YES bid</text>',
-        '<text x="88" y="40" fill="#ffd15c" font-size="12">YES ask</text>',
-        f'<text x="{width - 16}" y="22" fill="#aaaaaa" font-size="12" text-anchor="end">'
-        f"samples={max((len(item[1].get('samples') or []) for item in series), default=0)}  "
-        "open in eog</text>",
+        f'<text x="24" y="32" fill="#eeeeee" font-size="20" font-weight="700">'
+        f"{html.escape(word)}</text>",
+        f'<text x="24" y="54" fill="#888888" font-size="13">{html.escape(event_ticker)}  '
+        f"{html.escape(ticker)}</text>",
+        '<text x="24" y="74" fill="#5ce1ff" font-size="13">YES bid</text>',
+        '<text x="110" y="74" fill="#ffd15c" font-size="13">YES ask</text>',
+        f'<text x="{width - 24}" y="32" fill="#aaaaaa" font-size="13" text-anchor="end">'
+        f"n={len(samples)}  bid tot {bid_tot}  ask tot {ask_tot}</text>",
+        f'<rect x="{left}" y="{top}" width="{plot_w}" height="{plot_h}" '
+        f'fill="#191919" stroke="#333333"/>',
     ]
-    if not series:
-        parts.append('<text x="16" y="80" fill="#888888">no samples yet</text>')
-        parts.append("</svg>")
-        return "\n".join(parts)
-
-    for index, (ticker, payload) in enumerate(series):
-        top = header + index * CHART_PANEL_HEIGHT
-        samples = list(payload.get("samples") or [])
-        word = html.escape(str(payload.get("word") or ticker))
-        last = samples[-1] if samples else {}
-        bid_tot = format_size(parse_total(last.get("yes_bid_total"))) if last else "0.00"
-        ask_tot = format_size(parse_total(last.get("yes_ask_total"))) if last else "0.00"
+    for step in range(5):
+        frac = step / 4
+        price = y_max - frac * span
+        y = top + frac * plot_h
         parts.append(
-            f'<rect x="8" y="{top}" width="{width - 16}" height="{CHART_PANEL_HEIGHT - 4}" '
-            f'rx="6" fill="#1a1a1a" stroke="#2a2a2a"/>'
+            f'<line x1="{left}" y1="{y:.2f}" x2="{left + plot_w}" y2="{y:.2f}" '
+            f'stroke="#2a2a2a"/>'
         )
         parts.append(
-            f'<text x="16" y="{top + 14}" fill="#dddddd" font-size="12" font-weight="700">'
-            f"{word}</text>"
+            f'<text x="{left - 8}" y="{y + 4:.2f}" fill="#cccccc" font-size="12" '
+            f'text-anchor="end">{format_axis_price(price, span)}</text>'
         )
-        parts.append(
-            f'<text x="{width - 16}" y="{top + 14}" fill="#888888" font-size="11" '
-            f'text-anchor="end">{html.escape(ticker)}  bid tot {bid_tot}  ask tot {ask_tot}</text>'
+    parts.append(
+        f'<text x="18" y="{top + plot_h / 2:.1f}" fill="#dddddd" font-size="13" '
+        f'transform="rotate(-90 18 {top + plot_h / 2:.1f})">YES price ($)</text>'
+    )
+    tick_count = min(6, max(len(samples), 1))
+    if samples:
+        indexes = sorted(
+            {
+                round(i * (len(samples) - 1) / max(tick_count - 1, 1))
+                for i in range(tick_count)
+            }
         )
-        axis_top = top + CHART_PAD_TOP
-        axis_left = CHART_PAD_LEFT
-        parts.append(
-            f'<line x1="{axis_left}" y1="{axis_top}" x2="{axis_left}" '
-            f'y2="{axis_top + plot_h}" stroke="#333333"/>'
-        )
-        parts.append(
-            f'<line x1="{axis_left}" y1="{axis_top + plot_h}" x2="{axis_left + plot_w}" '
-            f'y2="{axis_top + plot_h}" stroke="#333333"/>'
-        )
-        parts.append(
-            f'<text x="{axis_left - 6}" y="{axis_top + 4}" fill="#666666" font-size="9" '
-            f'text-anchor="end">1</text>'
-        )
-        parts.append(
-            f'<text x="{axis_left - 6}" y="{axis_top + plot_h}" fill="#666666" font-size="9" '
-            f'text-anchor="end">0</text>'
-        )
-        ask_pts = _price_points(
-            samples, "yes_ask", left=axis_left, top=axis_top, width=plot_w, height=plot_h
-        )
-        bid_pts = _price_points(
-            samples, "yes_bid", left=axis_left, top=axis_top, width=plot_w, height=plot_h
-        )
-        parts.append(_svg_polyline(ask_pts, "#ffd15c", 1.8))
-        parts.append(_svg_polyline(bid_pts, "#5ce1ff", 1.8))
+        span_x = max(len(samples) - 1, 1)
+        for index in indexes:
+            x = left + (index / span_x) * plot_w
+            parts.append(
+                f'<line x1="{x:.2f}" y1="{top}" x2="{x:.2f}" y2="{top + plot_h}" '
+                f'stroke="#2a2a2a"/>'
+            )
+            parts.append(
+                f'<text x="{x:.2f}" y="{top + plot_h + 22}" fill="#cccccc" font-size="12" '
+                f'text-anchor="middle">{html.escape(format_axis_time(samples[index].get("ts")))}</text>'
+            )
+    parts.append(
+        f'<text x="{left + plot_w / 2:.1f}" y="{height - 16}" fill="#dddddd" '
+        f'font-size="13" text-anchor="middle">Time (UTC)</text>'
+    )
+    parts.append(_svg_polyline(
+        _price_points(
+            samples, "yes_ask", left=left, top=top, width=plot_w, height=plot_h,
+            y_min=y_min, y_max=y_max,
+        ),
+        "#ffd15c",
+        2.2,
+    ))
+    parts.append(_svg_polyline(
+        _price_points(
+            samples, "yes_bid", left=left, top=top, width=plot_w, height=plot_h,
+            y_min=y_min, y_max=y_max,
+        ),
+        "#5ce1ff",
+        2.2,
+    ))
     parts.append("</svg>")
     return "\n".join(part for part in parts if part)
 
 
-def write_history_chart(path: Path, history: Mapping[str, dict[str, Any]], event_ticker: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    svg = render_history_svg(history, event_ticker)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(svg, encoding="utf-8")
-    tmp.replace(path)
+def write_history_charts(
+    chart_dir: Path,
+    history: Mapping[str, dict[str, Any]],
+    event_ticker: str,
+) -> list[Path]:
+    chart_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for ticker, payload in history.items():
+        path = chart_dir / chart_filename(str(ticker))
+        svg = render_market_svg(str(ticker), payload, event_ticker)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(svg, encoding="utf-8")
+        tmp.replace(path)
+        written.append(path)
+    return written
 
 
 def build_snapshot(
@@ -543,7 +610,7 @@ def run_watch(
     )
     if chart_path is not None:
         print(
-            f"chart: {chart_path}  (eog {chart_path}   or   feh --reload 1 {chart_path})",
+            f"charts: {chart_path}/*.svg  (eog FILE.svg   or   feh --reload 1 FILE.svg)",
             file=err,
         )
     opened = False
@@ -598,7 +665,7 @@ def run_watch(
         append_jsonl(log_path, snapshot)
         append_history(history, snapshot)
         if chart_path is not None:
-            write_history_chart(chart_path, history, ticker)
+            write_history_charts(chart_path, history, ticker)
         dump_polls += 1
         if max_dumps and dump_polls >= max_dumps:
             return 0
@@ -642,12 +709,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--chart",
         type=Path,
         default=None,
-        help="SVG chart path rewritten each dump (default: ./orderbook-EVENT.svg)",
+        help="Directory of one SVG per market (default: ./orderbook-EVENT-charts)",
     )
     parser.add_argument(
         "--no-chart",
         action="store_true",
-        help="Do not write an SVG chart",
+        help="Do not write SVG charts",
     )
     parser.add_argument(
         "--depth",
@@ -705,7 +772,7 @@ def main(
     elif args.chart is not None:
         chart_path = args.chart.expanduser()
     else:
-        chart_path = log_path.with_suffix(".svg")
+        chart_path = log_path.parent / f"{log_path.stem}-charts"
     try:
         return run_watch(
             ticker,
