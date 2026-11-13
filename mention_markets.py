@@ -27,7 +27,8 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen as stdlib_urlopen
 
 
-VERSION = "1.4.0"
+VERSION = "1.6.0"
+SKIP_MARKET_STATUSES = frozenset({"closed", "determined", "settled", "finalized"})
 DEFAULT_JSON_PATH = Path.home() / ".config" / "mention-scout" / "calendar-added.json"
 KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 KNOWN_ACTIONS = ("google-news",)
@@ -383,10 +384,10 @@ def chrome_open_new_tab(url: str) -> bool:
         return bool(webbrowser.open_new_tab(url))
 
 
-def is_open_market(market: dict[str, Any]) -> bool:
-    """Keep markets Kalshi reports as active or open."""
+def is_usable_market_status(market: dict[str, Any]) -> bool:
+    """Keep created markets, including initialized/unopened; skip settled/closed."""
     status = str(market.get("status") or "").casefold()
-    return status in {"active", "open"}
+    return status not in SKIP_MARKET_STATUSES
 
 
 def public_json_get(
@@ -494,10 +495,10 @@ def fetch_markets_rest_paginated(
 
 
 def usable_markets(markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Unique active/open markets, first ticker wins."""
+    """Unique created markets (including initialized), first ticker wins."""
     by_ticker: dict[str, dict[str, Any]] = {}
     for market in markets:
-        if not is_open_market(market):
+        if not is_usable_market_status(market):
             continue
         ticker = str(market.get("ticker") or "").strip()
         if not ticker or ticker in by_ticker:
@@ -512,7 +513,7 @@ def news_tabs_for_markets(
     guest: str | None,
     event_ticker: str,
 ) -> list[NewsTab]:
-    """Build Kalshi event tab plus Google tabs for active/open market words."""
+    """Build Kalshi event tab plus Google tabs for created market words."""
     tabs: list[NewsTab] = [
         NewsTab(
             word="kalshi.com",
@@ -664,7 +665,7 @@ def cmd_target(
     word_tabs = [tab for tab in tabs if tab.ticker != KALSHI_EVENT_TAB_TICKER]
     if not word_tabs:
         print(
-            f"No active/open mention markets with usable words for {event.ticker}",
+            f"No mention markets with usable words for {event.ticker}",
             file=sys.stderr,
         )
         return 1

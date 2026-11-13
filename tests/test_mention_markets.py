@@ -566,7 +566,7 @@ def test_interview_missing_guest_exits_1(
     assert opener.urls == []
 
 
-def test_inactive_unopened_markets_are_not_opened(
+def test_initialized_unopened_markets_are_opened(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     path = _write_calendar(tmp_path / "calendar-added.json", SAMPLE_ENTRIES)
@@ -593,6 +593,11 @@ def test_inactive_unopened_markets_are_not_opened(
                     "status": "inactive",
                     "custom_strike": {"Word": "InactiveWord"},
                 },
+                {
+                    "ticker": "KXWORLDNEWSMENTION-26NOV13-AI",
+                    "status": "initialized",
+                    "yes_sub_title": "AI / Artificial Intelligence",
+                },
             ],
             "cursor": "",
         }
@@ -608,10 +613,11 @@ def test_inactive_unopened_markets_are_not_opened(
     assert code == 0
     out = capsys.readouterr().out
     assert "OpenAI / Anthropic" in out
+    assert "SoonWord" in out
+    assert "InactiveWord" in out
+    assert "AI / Artificial Intelligence" in out
     assert "ClosedWord" not in out
-    assert "SoonWord" not in out
-    assert "InactiveWord" not in out
-    assert len(opener.urls) == 2
+    assert len(opener.urls) == 5
     assert opener.urls[0].startswith("https://kalshi.com/markets/")
 
 
@@ -641,7 +647,7 @@ def test_empty_open_markets_exits_1_without_opening(
     )
     assert code == 1
     assert opener.urls == []
-    assert "No active/open mention markets" in capsys.readouterr().err
+    assert "No mention markets with usable words" in capsys.readouterr().err
 
 
 def test_unknown_action_exits_1(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
