@@ -21,7 +21,7 @@ from urllib.parse import urlencode
 
 import mention_markets as mm
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 CHART_TICK_MINUTES = 5
 WORLD_NEWS_END_HOUR = 19
 CHART_WIDTH = 1100
@@ -418,17 +418,29 @@ def is_world_news_event(event_ticker: str) -> bool:
     return mm.kalshi_event_ticker(event_ticker).startswith(mm.WORLD_NEWS_TICKER_PREFIX)
 
 
+def floor_to_minute(when: datetime) -> datetime:
+    return when.replace(second=0, microsecond=0)
+
+
 def floor_minutes(when: datetime, minutes: int = CHART_TICK_MINUTES) -> datetime:
-    when = when.replace(second=0, microsecond=0)
+    when = floor_to_minute(when)
     return when.replace(minute=(when.minute // minutes) * minutes)
 
 
 def ceil_minutes(when: datetime, minutes: int = CHART_TICK_MINUTES) -> datetime:
     floored = floor_minutes(when, minutes)
-    stripped = when.replace(second=0, microsecond=0)
-    if stripped == floored:
+    if floor_to_minute(when) == floored:
         return floored
     return floored + timedelta(minutes=minutes)
+
+
+def next_five_minute(when: datetime) -> datetime:
+    """Next 5-minute clock mark at or after ``when`` (seconds dropped)."""
+    aligned = floor_to_minute(when)
+    floored = floor_minutes(aligned)
+    if floored == aligned:
+        return aligned
+    return floored + timedelta(minutes=CHART_TICK_MINUTES)
 
 
 def sample_local_times(
@@ -449,12 +461,12 @@ def time_window(
 ) -> tuple[datetime, datetime]:
     times = sample_local_times(samples, tz)
     if times:
-        start = floor_minutes(times[0])
+        start = floor_to_minute(times[0])
         end = ceil_minutes(times[-1])
         if end <= start:
             end = start + timedelta(minutes=CHART_TICK_MINUTES)
     else:
-        start = floor_minutes(datetime.now(tz))
+        start = floor_to_minute(datetime.now(tz))
         end = start + timedelta(minutes=CHART_TICK_MINUTES)
     if is_world_news_event(event_ticker):
         day = times[0] if times else datetime.now(tz)
@@ -467,17 +479,17 @@ def time_window(
 
 
 def five_minute_ticks(start: datetime, end: datetime) -> list[datetime]:
-    ticks: list[datetime] = []
-    cursor = floor_minutes(start)
-    if cursor < start:
+    """Start on the current minute, then 5-minute marks: 10:39, 10:40, 10:45, …"""
+    start = floor_to_minute(start)
+    ticks: list[datetime] = [start]
+    cursor = next_five_minute(start)
+    if cursor == start:
         cursor += timedelta(minutes=CHART_TICK_MINUTES)
     while cursor <= end:
         ticks.append(cursor)
         cursor += timedelta(minutes=CHART_TICK_MINUTES)
-    if ticks and ticks[-1] < end:
+    if ticks[-1] < end:
         ticks.append(end)
-    if not ticks:
-        ticks = [start, end]
     return ticks
 
 

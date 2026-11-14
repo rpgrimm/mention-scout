@@ -165,14 +165,20 @@ def test_world_news_x_axis_five_minutes_until_19() -> None:
     ny = ZoneInfo("America/New_York")
     samples = [{"ts": "2026-11-13T19:04:00Z"}]
     start, end = watch.time_window(samples, "KXWORLDNEWSMENTION-26NOV13", ny)
-    assert start.strftime("%H:%M") == "14:00"
+    assert start.strftime("%H:%M") == "14:04"
     assert end.strftime("%H:%M") == "19:00"
     ticks = watch.five_minute_ticks(start, end)
-    assert ticks[0].strftime("%H:%M") == "14:00"
+    assert ticks[0].strftime("%H:%M") == "14:04"
     assert ticks[1].strftime("%H:%M") == "14:05"
     assert ticks[-1].strftime("%H:%M") == "19:00"
     other_start, other_end = watch.time_window(samples, "KXMTPMENTION-26NOV13", ny)
+    assert other_start.strftime("%H:%M") == "14:04"
     assert other_end.strftime("%H:%M") == "14:05"
+    odd = watch.five_minute_ticks(
+        datetime(2026, 11, 14, 10, 39, 20, tzinfo=ny),
+        datetime(2026, 11, 14, 19, 0, tzinfo=ny),
+    )
+    assert [t.strftime("%H:%M") for t in odd[:4]] == ["10:39", "10:40", "10:45", "10:50"]
     svg = watch.render_market_svg(
         "KXWORLDNEWSMENTION-26NOV13-AI",
         {
@@ -189,9 +195,10 @@ def test_world_news_x_axis_five_minutes_until_19() -> None:
         "KXWORLDNEWSMENTION-26NOV13",
         tz=ny,
     )
-    assert "14:00" in svg
+    assert "14:04" in svg
     assert "14:05" in svg
     assert "19:00" in svg
+    assert "14:00" not in svg
     assert "14:04:00" not in svg
 
 
