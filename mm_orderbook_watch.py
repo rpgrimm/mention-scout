@@ -21,9 +21,11 @@ from urllib.parse import urlencode
 
 import mention_markets as mm
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 CHART_TICK_MINUTES = 5
 WORLD_NEWS_END_HOUR = 19
+CHART_MINUTE_GRID = "#2c2c2c"
+CHART_FIVE_MIN_GRID = "#5a5a5a"
 CHART_WIDTH = 1100
 CHART_PAD_LEFT = 72
 CHART_PAD_RIGHT = 28
@@ -493,6 +495,17 @@ def five_minute_ticks(start: datetime, end: datetime) -> list[datetime]:
     return ticks
 
 
+def minute_ticks(start: datetime, end: datetime) -> list[datetime]:
+    """Every local minute from start through end, for vertical grid lines."""
+    start = floor_to_minute(start)
+    ticks: list[datetime] = []
+    cursor = start
+    while cursor <= end:
+        ticks.append(cursor)
+        cursor += timedelta(minutes=1)
+    return ticks
+
+
 def format_axis_price(value: float, span: float) -> str:
     if span < 0.08:
         return f"{value:.4f}"
@@ -682,15 +695,25 @@ def render_market_svg(
         f'<text x="18" y="{spread_top + CHART_SPREAD_H / 2:.1f}" fill="#ff79c6" font-size="13" '
         f'transform="rotate(-90 18 {spread_top + CHART_SPREAD_H / 2:.1f})">Spread ($)</text>'
     )
+    for minute in minute_ticks(t_min, t_max):
+        x = _x_at(minute, t_min, t_max, left, plot_w)
+        parts.append(
+            f'<line x1="{x:.2f}" y1="{price_top}" x2="{x:.2f}" '
+            f'y2="{price_top + CHART_PRICE_H}" stroke="{CHART_MINUTE_GRID}"/>'
+        )
+        parts.append(
+            f'<line x1="{x:.2f}" y1="{spread_top}" x2="{x:.2f}" '
+            f'y2="{spread_top + CHART_SPREAD_H}" stroke="{CHART_MINUTE_GRID}"/>'
+        )
     for tick in ticks:
         x = _x_at(tick, t_min, t_max, left, plot_w)
         parts.append(
             f'<line x1="{x:.2f}" y1="{price_top}" x2="{x:.2f}" '
-            f'y2="{price_top + CHART_PRICE_H}" stroke="#2a2a2a"/>'
+            f'y2="{price_top + CHART_PRICE_H}" stroke="{CHART_FIVE_MIN_GRID}"/>'
         )
         parts.append(
             f'<line x1="{x:.2f}" y1="{spread_top}" x2="{x:.2f}" '
-            f'y2="{spread_top + CHART_SPREAD_H}" stroke="#2a2a2a"/>'
+            f'y2="{spread_top + CHART_SPREAD_H}" stroke="{CHART_FIVE_MIN_GRID}"/>'
         )
         label = html.escape(tick.strftime("%H:%M"))
         label_y = spread_top + CHART_SPREAD_H + 20

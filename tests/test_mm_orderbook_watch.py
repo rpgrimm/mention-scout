@@ -179,6 +179,19 @@ def test_world_news_x_axis_five_minutes_until_19() -> None:
         datetime(2026, 11, 14, 19, 0, tzinfo=ny),
     )
     assert [t.strftime("%H:%M") for t in odd[:4]] == ["10:39", "10:40", "10:45", "10:50"]
+    minutes = watch.minute_ticks(
+        datetime(2026, 11, 14, 10, 39, tzinfo=ny),
+        datetime(2026, 11, 14, 10, 45, tzinfo=ny),
+    )
+    assert [t.strftime("%H:%M") for t in minutes] == [
+        "10:39",
+        "10:40",
+        "10:41",
+        "10:42",
+        "10:43",
+        "10:44",
+        "10:45",
+    ]
     svg = watch.render_market_svg(
         "KXWORLDNEWSMENTION-26NOV13-AI",
         {
@@ -200,6 +213,9 @@ def test_world_news_x_axis_five_minutes_until_19() -> None:
     assert "19:00" in svg
     assert "14:00" not in svg
     assert "14:04:00" not in svg
+    minute_lines = svg.count(f'stroke="{watch.CHART_MINUTE_GRID}"')
+    assert minute_lines == 2 * len(watch.minute_ticks(start, end))
+    assert minute_lines > 2 * len(ticks)
 
 
 def test_complement_asks_are_one_minus_bid() -> None:
