@@ -158,7 +158,41 @@ def test_wait_then_dump_orderbook_once(tmp_path: Path, capsys: pytest.CaptureFix
 
 def test_format_axis_time_uses_local_timezone() -> None:
     ny = ZoneInfo("America/New_York")
-    assert watch.format_axis_time("2026-11-13T19:04:00Z", tz=ny) == "14:04:00"
+    assert watch.format_axis_time("2026-11-13T19:04:00Z", tz=ny) == "14:04"
+
+
+def test_world_news_x_axis_five_minutes_until_19() -> None:
+    ny = ZoneInfo("America/New_York")
+    samples = [{"ts": "2026-11-13T19:04:00Z"}]
+    start, end = watch.time_window(samples, "KXWORLDNEWSMENTION-26NOV13", ny)
+    assert start.strftime("%H:%M") == "14:00"
+    assert end.strftime("%H:%M") == "19:00"
+    ticks = watch.five_minute_ticks(start, end)
+    assert ticks[0].strftime("%H:%M") == "14:00"
+    assert ticks[1].strftime("%H:%M") == "14:05"
+    assert ticks[-1].strftime("%H:%M") == "19:00"
+    other_start, other_end = watch.time_window(samples, "KXMTPMENTION-26NOV13", ny)
+    assert other_end.strftime("%H:%M") == "14:05"
+    svg = watch.render_market_svg(
+        "KXWORLDNEWSMENTION-26NOV13-AI",
+        {
+            "word": "AI",
+            "samples": [
+                {
+                    "ts": "2026-11-13T19:04:00Z",
+                    "yes_bid": Decimal("0.4200"),
+                    "yes_ask": Decimal("0.4500"),
+                    "spread": Decimal("0.0300"),
+                }
+            ],
+        },
+        "KXWORLDNEWSMENTION-26NOV13",
+        tz=ny,
+    )
+    assert "14:00" in svg
+    assert "14:05" in svg
+    assert "19:00" in svg
+    assert "14:04:00" not in svg
 
 
 def test_complement_asks_are_one_minus_bid() -> None:
@@ -260,8 +294,10 @@ def test_history_chart_polyline_over_time(tmp_path: Path) -> None:
     assert "Time (UTC)" not in svg
     ny = ZoneInfo("America/New_York")
     svg_ny = watch.render_market_svg(ticker, history[ticker], "KXWORLDNEWSMENTION-26NOV13", tz=ny)
-    assert "13:30:01" in svg_ny
-    assert "13:30:02" in svg_ny
+    assert "13:30" in svg_ny
+    assert "13:35" in svg_ny
+    assert "19:00" in svg_ny
+    assert "13:30:01" not in svg_ny
     assert "Time (EST)" in svg_ny
     assert watch.format_axis_time("2026-11-13T18:30:01Z") in svg
     assert watch.format_axis_time("2026-11-13T18:30:02Z") in svg

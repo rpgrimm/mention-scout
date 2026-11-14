@@ -13,7 +13,7 @@ import os
 import re
 import sys
 import time
-from datetime import date, datetime, timezone, tzinfo
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Mapping, TextIO
@@ -21,7 +21,9 @@ from urllib.parse import urlencode
 
 import mention_markets as mm
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
+CHART_TICK_MINUTES = 5
+WORLD_NEWS_END_HOUR = 19
 CHART_WIDTH = 1100
 CHART_PAD_LEFT = 72
 CHART_PAD_RIGHT = 28
@@ -404,12 +406,79 @@ def tz_abbrev(tz: tzinfo | None = None) -> str:
 
 
 def format_axis_time(ts: Any, *, tz: tzinfo | None = None) -> str:
-    """Chart axis clock in local time (JSONL stays UTC)."""
+    """Chart axis clock in local time, no seconds (JSONL stays UTC)."""
     parsed = parse_iso_ts(ts)
     if parsed is None:
         return str(ts or "?")
     zone = tz if tz is not None else local_timezone()
-    return parsed.astimezone(zone).strftime("%H:%M:%S")
+    return parsed.astimezone(zone).strftime("%H:%M")
+
+
+def is_world_news_event(event_ticker: str) -> bool:
+    return mm.kalshi_event_ticker(event_ticker).startswith(mm.WORLD_NEWS_TICKER_PREFIX)
+
+
+def floor_minutes(when: datetime, minutes: int = CHART_TICK_MINUTES) -> datetime:
+    when = when.replace(second=0, microsecond=0)
+    return when.replace(minute=(when.minute // minutes) * minutes)
+
+
+def ceil_minutes(when: datetime, minutes: int = CHART_TICK_MINUTES) -> datetime:
+    floored = floor_minutes(when, minutes)
+    stripped = when.replace(second=0, microsecond=0)
+    if stripped == floored:
+        return floored
+    return floored + timedelta(minutes=minutes)
+
+
+def sample_local_times(
+    samples: list[Mapping[str, Any]], tz: tzinfo
+) -> list[datetime]:
+    times: list[datetime] = []
+    for sample in samples:
+        parsed = parse_iso_ts(sample.get("ts"))
+        if parsed is not None:
+            times.append(parsed.astimezone(tz))
+    return times
+
+
+def time_window(
+    samples: list[Mapping[str, Any]],
+    event_ticker: str,
+    tz: tzinfo,
+) -> tuple[datetime, datetime]:
+    times = sample_local_times(samples, tz)
+    if times:
+        start = floor_minutes(times[0])
+        end = ceil_minutes(times[-1])
+        if end <= start:
+            end = start + timedelta(minutes=CHART_TICK_MINUTES)
+    else:
+        start = floor_minutes(datetime.now(tz))
+        end = start + timedelta(minutes=CHART_TICK_MINUTES)
+    if is_world_news_event(event_ticker):
+        day = times[0] if times else datetime.now(tz)
+        wnt_end = day.replace(
+            hour=WORLD_NEWS_END_HOUR, minute=0, second=0, microsecond=0
+        )
+        if wnt_end > start:
+            end = max(end, wnt_end)
+    return start, end
+
+
+def five_minute_ticks(start: datetime, end: datetime) -> list[datetime]:
+    ticks: list[datetime] = []
+    cursor = floor_minutes(start)
+    if cursor < start:
+        cursor += timedelta(minutes=CHART_TICK_MINUTES)
+    while cursor <= end:
+        ticks.append(cursor)
+        cursor += timedelta(minutes=CHART_TICK_MINUTES)
+    if ticks and ticks[-1] < end:
+        ticks.append(end)
+    if not ticks:
+        ticks = [start, end]
+    return ticks
 
 
 def format_axis_price(value: float, span: float) -> str:
@@ -459,6 +528,13 @@ def spread_window(samples: list[Mapping[str, Any]]) -> tuple[float, float]:
     return low, high + pad
 
 
+def _x_at(when: datetime, t_min: datetime, t_max: datetime, left: float, width: float) -> float:
+    span = max((t_max - t_min).total_seconds(), 1.0)
+    frac = (when - t_min).total_seconds() / span
+    frac = min(max(frac, 0.0), 1.0)
+    return left + frac * width
+
+
 def _price_points(
     samples: list[Mapping[str, Any]],
     field: str,
@@ -469,19 +545,19 @@ def _price_points(
     height: float,
     y_min: float,
     y_max: float,
+    t_min: datetime,
+    t_max: datetime,
+    tz: tzinfo,
 ) -> list[tuple[float, float]]:
-    count = len(samples)
-    if count == 0:
-        return []
-    span_x = max(count - 1, 1)
     span_y = max(y_max - y_min, 1e-9)
     points: list[tuple[float, float]] = []
-    for index, sample in enumerate(samples):
+    for sample in samples:
         price = sample.get(field)
-        if not isinstance(price, Decimal):
+        parsed = parse_iso_ts(sample.get("ts"))
+        if not isinstance(price, Decimal) or parsed is None:
             continue
         clamped = min(max(float(price), y_min), y_max)
-        x = left + (index / span_x) * width
+        x = _x_at(parsed.astimezone(tz), t_min, t_max, left, width)
         y = top + (1.0 - (clamped - y_min) / span_y) * height
         points.append((x, y))
     return points
@@ -556,6 +632,9 @@ def render_market_svg(
     price_top = CHART_PAD_TOP
     spread_top = CHART_PAD_TOP + CHART_PRICE_H + CHART_PANEL_GAP
     zone = tz if tz is not None else local_timezone()
+    t_min, t_max = time_window(samples, event_ticker, zone)
+    ticks = five_minute_ticks(t_min, t_max)
+    rotate_labels = len(ticks) > 14
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}" role="img">',
@@ -591,29 +670,27 @@ def render_market_svg(
         f'<text x="18" y="{spread_top + CHART_SPREAD_H / 2:.1f}" fill="#ff79c6" font-size="13" '
         f'transform="rotate(-90 18 {spread_top + CHART_SPREAD_H / 2:.1f})">Spread ($)</text>'
     )
-    tick_count = min(6, max(len(samples), 1))
-    if samples:
-        indexes = sorted(
-            {
-                round(i * (len(samples) - 1) / max(tick_count - 1, 1))
-                for i in range(tick_count)
-            }
+    for tick in ticks:
+        x = _x_at(tick, t_min, t_max, left, plot_w)
+        parts.append(
+            f'<line x1="{x:.2f}" y1="{price_top}" x2="{x:.2f}" '
+            f'y2="{price_top + CHART_PRICE_H}" stroke="#2a2a2a"/>'
         )
-        span_x = max(len(samples) - 1, 1)
-        for index in indexes:
-            x = left + (index / span_x) * plot_w
+        parts.append(
+            f'<line x1="{x:.2f}" y1="{spread_top}" x2="{x:.2f}" '
+            f'y2="{spread_top + CHART_SPREAD_H}" stroke="#2a2a2a"/>'
+        )
+        label = html.escape(tick.strftime("%H:%M"))
+        label_y = spread_top + CHART_SPREAD_H + 20
+        if rotate_labels:
             parts.append(
-                f'<line x1="{x:.2f}" y1="{price_top}" x2="{x:.2f}" '
-                f'y2="{price_top + CHART_PRICE_H}" stroke="#2a2a2a"/>'
+                f'<text x="{x:.2f}" y="{label_y:.2f}" fill="#cccccc" font-size="10" '
+                f'text-anchor="end" transform="rotate(-45 {x:.2f} {label_y:.2f})">{label}</text>'
             )
+        else:
             parts.append(
-                f'<line x1="{x:.2f}" y1="{spread_top}" x2="{x:.2f}" '
-                f'y2="{spread_top + CHART_SPREAD_H}" stroke="#2a2a2a"/>'
-            )
-            parts.append(
-                f'<text x="{x:.2f}" y="{spread_top + CHART_SPREAD_H + 22}" fill="#cccccc" '
-                f'font-size="12" text-anchor="middle">'
-                f'{html.escape(format_axis_time(samples[index].get("ts"), tz=tz))}</text>'
+                f'<text x="{x:.2f}" y="{label_y:.2f}" fill="#cccccc" font-size="12" '
+                f'text-anchor="middle">{label}</text>'
             )
     parts.append(
         f'<text x="{left + plot_w / 2:.1f}" y="{height - 16}" fill="#dddddd" '
@@ -621,11 +698,11 @@ def render_market_svg(
     )
     bid_pts = _price_points(
         samples, "yes_bid", left=left, top=price_top, width=plot_w, height=CHART_PRICE_H,
-        y_min=y_min, y_max=y_max,
+        y_min=y_min, y_max=y_max, t_min=t_min, t_max=t_max, tz=zone,
     )
     ask_pts = _price_points(
         samples, "yes_ask", left=left, top=price_top, width=plot_w, height=CHART_PRICE_H,
-        y_min=y_min, y_max=y_max,
+        y_min=y_min, y_max=y_max, t_min=t_min, t_max=t_max, tz=zone,
     )
     parts.append(_svg_band(bid_pts, ask_pts))
     parts.append(_svg_polyline(ask_pts, "#ffd15c", 2.2))
@@ -633,7 +710,7 @@ def render_market_svg(
     parts.append(_svg_polyline(
         _price_points(
             samples, "spread", left=left, top=spread_top, width=plot_w, height=CHART_SPREAD_H,
-            y_min=s_min, y_max=s_max,
+            y_min=s_min, y_max=s_max, t_min=t_min, t_max=t_max, tz=zone,
         ),
         "#ff79c6",
         2.4,
